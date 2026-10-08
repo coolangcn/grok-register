@@ -53,6 +53,22 @@ def bind_runtime(namespace):
         if name.startswith("__") or name in _OWN_NAMES or name in {"config", "_cf_domain_index", "_cloudmail_domain_index"}:
             continue
         globals()[name] = value
+    _force_direct_http()
+
+
+def _force_direct_http():
+    """邮件 API 请求一律绕过代理，避免代理节点故障导致 TLS 握手失败。"""
+    for _name in ("http_get", "http_post"):
+        _fn = globals().get(_name)
+        if callable(_fn):
+            globals()[_name] = _make_direct_http(_fn)
+
+
+def _make_direct_http(fn):
+    def wrapper(url, **kwargs):
+        kwargs.setdefault("use_proxy", False)
+        return fn(url, **kwargs)
+    return wrapper
 
 
 def normalize_mail_body(*sources):
@@ -526,6 +542,22 @@ def cloudmail_get_email_and_token():
     # 仅返回非敏感占位凭证；公共 Token 始终只从 config.json 读取。
     return address, f"cloudmail:{address}"
 
+def _cloudmail_http_post_with_retry(url, **kwargs):
+    """邮件接口请求：失败后快速退避重试，规避服务器端间歇性 TLS 断连。"""
+    kwargs.setdefault("use_proxy", False)
+    kwargs.setdefault("timeout", 20)
+    last_exc = None
+    for attempt in range(4):
+        try:
+            return http_post(url, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            err = str(exc or "").lower()
+            if "tls" not in err and "ssl" not in err:
+                raise
+            time.sleep(0.5 + attempt * 0.5)
+    raise last_exc
+
 def cloudmail_get_messages(address):
     api_base = get_cloudmail_api_base()
     if not api_base:
@@ -541,13 +573,8 @@ def cloudmail_get_messages(address):
         "num": 1,
         "size": 20,
     }
-    resp = http_post(
-        f"{api_base}{get_cloudmail_path()}",
-        headers=cloudmail_build_headers(),
-        json=payload,
-        timeout=20,
-        replay_safe=True,
-    )
+    url = f"{api_base}{get_cloudmail_path()}"
+    resp = _cloudmail_http_post_with_retry(url, headers=cloudmail_build_headers(), json=payload)
 
     data = None
     try:

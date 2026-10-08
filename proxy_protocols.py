@@ -478,12 +478,14 @@ def parse_subscription_source(text):
         if not line or line.startswith("#"):
             continue
         result.total_lines += 1
-        if result.total_lines > MAX_SOURCE_ENTRIES:
-            raise ProxyProtocolError("代理源超过 10000 个节点限制")
+        if len(result.nodes) >= MAX_SOURCE_ENTRIES:
+            # 超出上限时截断，保留头部节点而非整体失败
+            continue
         try:
             descriptor = parse_proxy_line(line)
         except Exception as exc:
-            result.errors.append("line %s: %s" % (result.total_lines, exc))
+            if len(result.errors) < MAX_SOURCE_ENTRIES:
+                result.errors.append("line %s: %s" % (result.total_lines, exc))
             continue
         if descriptor.node_id in seen:
             continue

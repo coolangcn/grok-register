@@ -22,6 +22,9 @@ from proxy_protocols import ProxyDescriptor, ProxyProtocolError, parse_proxy_lin
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 _MAX_SOURCE_BYTES = 2 << 20
+_XAI_BUSINESS_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+_XAI_CHALLENGE_MARKERS = ("just a moment", "__cf_chl_", "cf-chl", "attention required", "cf-error", "请稍等", "验证你")
+_DEFAULT_PROBE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
 _TLS = threading.local()
 _MANAGER_LOCK = threading.RLock()
 _MANAGER = None
@@ -325,6 +328,10 @@ class ProxyPoolManager:
                     "exit_successes": node.exit_successes, "exit_failures": node.exit_failures,
                     "failure_count": node.failure_count, "cooldown_until": node.cooldown_until,
                     "last_error": node.last_error, "last_success_at": node.last_success_at, "last_failure_at": node.last_failure_at,
+                    "probe_status": node.probe_status, "last_probed_at": node.last_probed_at,
+                    "probe_latency_ms": node.probe_latency_ms, "probe_error": node.probe_error,
+                    "exit_ip": node.exit_ip,
+                    "ipv4_probe": self._family_dict(node.ipv4_probe), "ipv6_probe": self._family_dict(node.ipv6_probe),
                 }
         directory = os.path.dirname(os.path.abspath(self.state_path))
         os.makedirs(directory, exist_ok=True)
@@ -354,9 +361,20 @@ class ProxyPoolManager:
             "health", "business_samples", "registration_successes", "transport_failures", "suspected_failures",
             "configuration_failures", "exit_successes", "exit_failures", "failure_count", "cooldown_until",
             "last_error", "last_success_at", "last_failure_at",
+            "probe_status", "last_probed_at", "probe_latency_ms", "probe_error", "exit_ip",
         ):
             if key in saved:
                 setattr(node, key, saved[key])
+        for key in ("ipv4_probe", "ipv6_probe"):
+            value = saved.get(key)
+            if isinstance(value, dict):
+                setattr(node, key, ProbeFamilyState(
+                    status=str(value.get("status") or "unknown"),
+                    tested_at=value.get("tested_at"),
+                    latency_ms=int(value.get("latency_ms") or 0),
+                    exit_ip=str(value.get("exit_ip") or ""),
+                    error=str(value.get("error") or ""),
+                ))
 
     def _rotating_for(self, descriptor):
         if self.endpoint_mode == "rotating":
@@ -759,6 +777,32 @@ class ProxyPoolManager:
             if line.startswith("ip="): return line[3:].strip()
         return ""
 
+    def _probe_xai_business(self, proxy_url):
+        """业务级探测：模拟 Chrome 指纹访问 x.ai 注册页，要求 2xx 且非 Cloudflare 拦截页。"""
+        headers = {
+            "User-Agent": str(self.config.get("user_agent") or _DEFAULT_PROBE_UA).strip(),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        response = requests.get(
+            _XAI_BUSINESS_URL,
+            proxies={"http": proxy_url, "https": proxy_url},
+            timeout=max(self.probe_timeout, 15),
+            allow_redirects=True,
+            headers=headers,
+            impersonate="chrome120",
+        )
+        status_code = int(response.status_code)
+        if not 200 <= status_code < 300:
+            raise ProxyPoolError("x.ai 业务探测 HTTP %s" % status_code)
+        text = str(response.text or "")[:8192].lower()
+        for marker in _XAI_CHALLENGE_MARKERS:
+            if marker in text:
+                raise ProxyPoolError("x.ai 业务探测被风控拦截（%s）" % marker)
+        title_pos = text.find("<title")
+        if title_pos < 0:
+            raise ProxyPoolError("x.ai 业务探测返回内容异常（缺少页面结构）")
+
     def _probe_family(self, descriptor, session_key, family):
         runtime_key = None; started = time.monotonic(); status = "unhealthy"; exit_ip = ""; error = ""
         try:
@@ -773,7 +817,10 @@ class ProxyPoolManager:
             expected = 6 if family == "ipv6" else 4
             if parsed_ip.version != expected:
                 raise ProxyPoolError("探测服务返回的 IP family 与 %s 不匹配" % family)
-            exit_ip = str(parsed_ip); status = "healthy"
+            exit_ip = str(parsed_ip)
+            if self.probe_provider == "xai":
+                self._probe_xai_business(proxy_url)
+            status = "healthy"
         except Exception as exc:
             error = safe_proxy_error_text(exc)
         finally:
@@ -842,19 +889,60 @@ class ProxyPoolManager:
                     if self._probe_events.get(node_id) is event: self._probe_events.pop(node_id, None)
         threading.Thread(target=runner, name="proxy-probe-%s" % node_id[:8], daemon=True).start()
 
-    def probe_all(self, force=False):
+    def probe_all(self, force=False, skip_healthy=False):
         now = time.time()
         with self._lock:
             if not force and self.probe_interval > 0 and now - self._last_probe_all < self.probe_interval: return []
-            node_ids = [node.id for node in self._nodes.values() if not node.retired]; self._last_probe_all = now
+            self._last_probe_all = now
+            freshness = max(60, (self.probe_interval * 2) if self.probe_interval > 0 else 300)
+            node_ids = []
+            for node in self._nodes.values():
+                if node.retired or node.inflight > 0:
+                    continue
+                if skip_healthy and node.probe_status == "healthy" and node.last_probed_at and now - node.last_probed_at <= freshness:
+                    continue
+                node_ids.append(node.id)
         results = []
         if not node_ids: return results
-        with ThreadPoolExecutor(max_workers=min(8, len(node_ids)), thread_name_prefix="proxy-probe") as executor:
+        with ThreadPoolExecutor(max_workers=min(32, len(node_ids)), thread_name_prefix="proxy-probe") as executor:
             futures = {executor.submit(self.probe_node, node_id): node_id for node_id in node_ids}
             for future in as_completed(futures):
                 try: results.append(future.result())
                 except Exception as exc: results.append({"id": futures[future], "status": "unhealthy", "error": safe_proxy_error_text(exc)})
         return results
+
+    def prune_nodes(self, node_ids, only_invalid=False):
+        """批量移除代理节点。
+
+        参数:
+          - node_ids list[str]: 待删除的节点 id（只接受当前存在的节点）。
+          - only_invalid bool: 为 True 时，仅删除 probe_status 非 healthy 且无租约占用的节点。
+
+        返回:
+          - dict: removed(实际删除数) / ignored(被忽略数) / inflight(因占用未删数)。
+        """
+        if not node_ids:
+            return {"removed": 0, "ignored": 0, "inflight": 0}
+        wanted = set(node_ids)
+        removed = ignored = inflight = 0
+        with self._condition:
+            for node_id in list(wanted):
+                node = self._nodes.get(node_id)
+                if node is None:
+                    ignored += 1
+                    continue
+                if node.inflight > 0:
+                    inflight += 1
+                    continue
+                if only_invalid and node.probe_status == "healthy":
+                    ignored += 1
+                    continue
+                self._nodes.pop(node_id, None)
+                removed += 1
+            self._condition.notify_all()
+        if removed:
+            self._save_state_file()
+        return {"removed": removed, "ignored": ignored, "inflight": inflight}
 
     def preflight_node(self, node_id):
         """Non-destructive reachability test against registration-path origins."""
@@ -905,7 +993,37 @@ class ProxyPoolManager:
                     "ipv4_probe": self._family_dict(node.ipv4_probe), "ipv6_probe": self._family_dict(node.ipv6_probe),
                     "inflight": int(node.inflight), "retired": bool(node.retired),
                 })
-            return {"mode": self.mode, "managed": self.managed, "fallback": self.fallback, "capacity": self.capacity, "nodes": nodes, "sources": dict(self._source_diagnostics), "runtime": self._runtime.active_snapshot(), "persist_health": self.persist_health}
+            # 汇总统计
+            by_probe = {}
+            by_protocol = {}
+            by_backend = {}
+            by_source = {}
+            by_health_model = {}
+            total = len(nodes)
+            inflight_total = 0
+            for nd in self._nodes.values():
+                status = nd.probe_status or "unknown"
+                by_probe[status] = by_probe.get(status, 0) + 1
+                proto = nd.protocol or "unknown"
+                by_protocol[proto] = by_protocol.get(proto, 0) + 1
+                be = nd.backend or "native"
+                by_backend[be] = by_backend.get(be, 0) + 1
+                src = nd.source or "unknown"
+                by_source[src] = by_source.get(src, 0) + 1
+                hm = "gateway" if nd.rotating else "fixed"
+                by_health_model[hm] = by_health_model.get(hm, 0) + 1
+                inflight_total += nd.inflight
+            summary = {
+                "total": total,
+                "inflight": inflight_total,
+                "retired": sum(1 for nd in self._nodes.values() if nd.retired),
+                "by_probe_status": dict(sorted(by_probe.items())),
+                "by_protocol": dict(sorted(by_protocol.items())),
+                "by_backend": dict(sorted(by_backend.items())),
+                "by_source": dict(sorted(by_source.items())),
+                "by_health_model": dict(sorted(by_health_model.items())),
+            }
+            return {"mode": self.mode, "managed": self.managed, "fallback": self.fallback, "capacity": self.capacity, "nodes": nodes, "sources": dict(self._source_diagnostics), "runtime": self._runtime.active_snapshot(), "persist_health": self.persist_health, "summary": summary}
 
 
 def get_manager(config=None, log=None):

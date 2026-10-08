@@ -159,7 +159,7 @@ def validate_config_structure(raw):
         "proxy_mode": {"auto", "direct", "single", "pool"},
         "proxy_fallback": {"none", "direct", "single"},
         "proxy_pool_endpoint_mode": {"auto", "fixed", "rotating"},
-        "proxy_pool_probe_provider": {"cloudflare", "ipinfo"},
+        "proxy_pool_probe_provider": {"cloudflare", "ipinfo", "xai"},
         "proxy_protocol_backend": {"auto", "sing-box", "native-only"},
     }
     for key, allowed in enums.items():

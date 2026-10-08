@@ -12,7 +12,7 @@
     ['proxy_pool_refresh_interval_sec','number',{min:0,max:86400}],
     ['proxy_pool_probe_interval_sec','number',{min:0,max:86400}],
     ['proxy_pool_probe_timeout_sec','number',{min:3,max:120}],
-    ['proxy_pool_probe_provider','select',['cloudflare','ipinfo']],
+    ['proxy_pool_probe_provider','select',['cloudflare','ipinfo','xai']],
     ['proxy_pool_probe_dual_stack','checkbox'],
     ['proxy_pool_max_concurrent_per_node','number',{min:1,max:64}],
     ['proxy_pool_acquire_timeout_sec','number',{min:1,max:600}],
@@ -35,6 +35,9 @@
     proxySourceSummary:'订阅解析', proxyError:'最近错误', probeHealthy:'正常', probeUnhealthy:'异常',
     probeUnknown:'未探测', probeUnavailable:'运行时不可用', noBusinessSamples:'未产生业务样本', failedAfter:'后失败',
     proxyIPv4:'IPv4', proxyIPv6:'IPv6', proxyGatewayRate:'出口成功率', proxySamples:'样本',
+    proxySelectAll:'全选', proxyBatchDelete:'批量删除无效节点', proxyBatchDeleteSelected:'删除选中',
+    proxyDeleteConfirm:'确定删除选中的 {n} 个节点？', proxyDeleteResult:'已删除 {n} 个节点',
+    proxySelectInvalid:'仅选无效', proxySummary:'统计概览', proxyTotal:'总计', proxyRetired:'已退役',
   };
   const en = {
     tabProxy:'Proxy pool', proxyReload:'Reload', proxyTest:'Test nodes', proxyStatus:'Proxy node status',
@@ -44,6 +47,9 @@
     proxySourceSummary:'Subscription parse', proxyError:'Last error', probeHealthy:'Healthy', probeUnhealthy:'Unhealthy',
     probeUnknown:'Not probed', probeUnavailable:'Runtime unavailable', noBusinessSamples:'No business samples', failedAfter:'to failure',
     proxyIPv4:'IPv4', proxyIPv6:'IPv6', proxyGatewayRate:'Exit success', proxySamples:'Samples',
+    proxySelectAll:'Select all', proxyBatchDelete:'Batch delete invalid', proxyBatchDeleteSelected:'Delete selected',
+    proxyDeleteConfirm:'Delete {n} selected nodes?', proxyDeleteResult:'Deleted {n} nodes',
+    proxySelectInvalid:'Select invalid', proxySummary:'Summary', proxyTotal:'Total', proxyRetired:'Retired',
   };
   Object.assign(i18n.zh, zh); Object.assign(i18n.en, en);
   Object.assign(i18n.zh.fields, {
@@ -57,7 +63,7 @@
     proxy_pool_refresh_interval_sec:['订阅刷新间隔（秒）','0 表示关闭自动刷新。'],
     proxy_pool_probe_interval_sec:['健康探测间隔（秒）','0 表示关闭定期探测。探测状态与运行健康分相互独立。'],
     proxy_pool_probe_timeout_sec:['探测超时（秒）','单节点连通性检查超时。'],
-    proxy_pool_probe_provider:['探测服务','用于验证代理连通性和出口 IP。'],
+    proxy_pool_probe_provider:['探测服务','cloudflare/ipinfo 仅验证连通性和出口 IP；xai 会额外用 Chrome 指纹访问 accounts.x.ai 注册页，要求 2xx 且未被风控拦截。'],
     proxy_pool_probe_dual_stack:['双栈探测','分别执行 IPv4 / IPv6 连通性探测。'],
     proxy_pool_max_concurrent_per_node:['单节点最大并发','默认 1，避免多个注册 Session 共用同一固定出口。'],
     proxy_pool_acquire_timeout_sec:['租约等待超时（秒）','代理被占用或冷却时等待可用节点的最长时间。'],
@@ -82,7 +88,7 @@
     proxy_pool_refresh_interval_sec:['Refresh interval (seconds)','0 disables automatic source refresh.'],
     proxy_pool_probe_interval_sec:['Probe interval (seconds)','0 disables periodic probes. Probe status is independent from runtime health.'],
     proxy_pool_probe_timeout_sec:['Probe timeout (seconds)','Timeout for one connectivity probe.'],
-    proxy_pool_probe_provider:['Probe provider','Used to verify connectivity and exit IP.'],
+    proxy_pool_probe_provider:['Probe provider','cloudflare/ipinfo only verify connectivity and exit IP; xai additionally opens the accounts.x.ai sign-up page with a Chrome fingerprint and requires HTTP 2xx without risk-control interception.'],
     proxy_pool_probe_dual_stack:['Dual-stack probe','Probe IPv4 and IPv6 connectivity independently.'],
     proxy_pool_max_concurrent_per_node:['Max sessions per node','Defaults to 1 to avoid sharing one fixed exit across account sessions.'],
     proxy_pool_acquire_timeout_sec:['Lease wait timeout (seconds)','Maximum wait while nodes are busy or cooling down.'],
@@ -120,11 +126,15 @@
         <div class="proxy-status-actions">
           <button type="button" id="proxyReloadBtn" class="mini-btn"><span data-i18n="proxyReload">${t('proxyReload')}</span></button>
           <button type="button" id="proxyTestBtn" class="mini-btn"><span data-i18n="proxyTest">${t('proxyTest')}</span></button>
+          <button type="button" id="proxySelectInvalidBtn" class="mini-btn" style="opacity:0.7" disabled><span data-i18n="proxySelectInvalid">${t('proxySelectInvalid')}</span></button>
+          <button type="button" id="proxyPruneBtn" class="mini-btn mini-btn-danger" style="opacity:0.7" disabled><span data-i18n="proxyBatchDeleteSelected">${t('proxyBatchDeleteSelected')}</span></button>
         </div>
       </div>
       <div id="proxyPoolSummary" class="proxy-summary"></div>
       <div id="proxySourceSummary" class="proxy-summary"></div>
+      <div id="proxyStatsSummary" class="proxy-stats"><span class="proxy-stats-label" data-i18n="proxySummary">${t('proxySummary')}</span>: <span id="proxyStatsContent"></span></div>
       <div class="proxy-table-wrap"><table class="proxy-table"><thead><tr>
+        <th style="width:32px"><input type="checkbox" id="proxySelectAll" title="${t('proxySelectAll')}"></th>
         <th data-i18n="proxyNode">${t('proxyNode')}</th><th data-i18n="proxyProtocol">${t('proxyProtocol')}</th>
         <th data-i18n="proxyBackend">${t('proxyBackend')}</th><th data-i18n="proxyType">${t('proxyType')}</th>
         <th data-i18n="proxyProbeStatus">${t('proxyProbeStatus')}</th><th data-i18n="proxyRunHealth">${t('proxyRunHealth')}</th>
@@ -154,10 +164,38 @@
     const p = node[key] || {}; if (!p.status || p.status === 'unknown') return `${key === 'ipv4_probe' ? 'IPv4' : 'IPv6'} —`;
     return `${key === 'ipv4_probe' ? 'IPv4' : 'IPv6'} ${probeText(p.status)}${p.latency_ms ? ' '+p.latency_ms+'ms' : ''}${p.exit_ip ? ' '+p.exit_ip : ''}`;
   }
+
+  function renderStatsSummary(data) {
+    const el = document.getElementById('proxyStatsContent'); if (!el) return;
+    const s = data && data.summary; if (!s) { el.textContent = ''; return; }
+    const parts = [];
+    parts.push(`${t('proxyTotal')}: ${s.total}`);
+    const byProbe = s.by_probe_status || {};
+    if (byProbe.healthy) parts.push(`\u2705 ${t('probeHealthy')}: ${byProbe.healthy}`);
+    if (byProbe.unhealthy) parts.push(`\u274c ${t('probeUnhealthy')}: ${byProbe.unhealthy}`);
+    if (byProbe.unknown) parts.push(`\u2753 ${t('probeUnknown')}: ${byProbe.unknown}`);
+    if (byProbe.unavailable) parts.push(`\u26a0 ${t('probeUnavailable')}: ${byProbe.unavailable}`);
+    if (s.retired) parts.push(`\u{1f504} ${t('proxyRetired')}: ${s.retired}`);
+    if (s.inflight) parts.push(`\u{1f4e1} ${t('proxyInflight')}: ${s.inflight}`);
+    const byProto = s.by_protocol || {};
+    const protoParts = Object.entries(byProto).map(([k,v]) => `${k}:${v}`);
+    if (protoParts.length) parts.push(`\u{1f4cb} ${t('proxyProtocol')}: ${protoParts.join(' / ')}`);
+    const byBackend = s.by_backend || {};
+    const backendParts = Object.entries(byBackend).map(([k,v]) => `${k}:${v}`);
+    if (backendParts.length) parts.push(`\u2699 ${t('proxyBackend')}: ${backendParts.join(' / ')}`);
+    const byModel = s.by_health_model || {};
+    const modelParts = Object.entries(byModel).map(([k,v]) => `${k}:${v}`);
+    if (modelParts.length) parts.push(`\u{1f4ca} ${t('proxyType')}: ${modelParts.join(' / ')}`);
+    el.textContent = parts.join(' | ');
+  }
+
   function renderProxyStatus(data) {
     const rows = document.getElementById('proxyPoolRows'); const summary = document.getElementById('proxyPoolSummary'); if (!rows || !summary) return;
-    const nodes = Array.isArray(data.nodes) ? data.nodes : []; summary.textContent = `${data.mode || 'auto'} · ${nodes.length} nodes${data.persist_health ? ' · persisted health' : ''}`; renderSourceSummary(data);
-    if (!nodes.length) { rows.innerHTML = `<tr><td colspan="12" class="proxy-empty">${esc(t('proxyEmpty'))}</td></tr>`; return; }
+    const nodes = Array.isArray(data.nodes) ? data.nodes : [];
+    summary.textContent = `${data.mode || 'auto'} · ${nodes.length} nodes${data.persist_health ? ' · persisted health' : ''}`;
+    renderSourceSummary(data);
+    renderStatsSummary(data);
+    if (!nodes.length) { rows.innerHTML = `<tr><td colspan="13" class="proxy-empty">${esc(t('proxyEmpty'))}</td></tr>`; return; }
     rows.innerHTML = nodes.map(node => {
       const status = node.probe_status === 'healthy' ? 'good' : (node.probe_status === 'unhealthy' || node.probe_status === 'unavailable') ? 'bad' : '';
       const label = node.name ? `${node.name} · ${node.proxy}` : node.proxy; const samples = Number(node.business_samples || 0);
@@ -168,6 +206,7 @@
       const error = node.probe_error || node.last_error || '—';
       const failures = node.rotating ? `${node.exit_failures || 0} exits` : `${node.failure_count || 0} · transport=${node.transport_failures || 0} · config=${node.configuration_failures || 0}`;
       return `<tr>
+        <td><input type="checkbox" class="proxy-node-cb" data-id="${esc(node.id)}" data-status="${esc(node.probe_status)}"></td>
         <td title="${esc(node.id)}"><span class="proxy-dot ${status}"></span>${esc(label)}</td>
         <td>${esc(node.protocol || '—')}</td><td>${esc(node.backend || 'native')}</td>
         <td>${node.rotating ? 'rotating gateway' : 'fixed'}</td><td>${esc(probeText(node.probe_status))}</td>
@@ -176,19 +215,103 @@
         <td title="${esc(error)}">${esc(error)}</td>
       </tr>`;
     }).join('');
+    // Sync select-all with checkbox state
+    updatePruneButtonState();
   }
-  async function refreshProxyStatus() { try { const r = await fetch('/api/proxy-pool/status'); if (!r.ok) return; renderProxyStatus(await r.json()); } catch (_) {} }
+
+  function updatePruneButtonState() {
+    const cbs = document.querySelectorAll('.proxy-node-cb:checked');
+    const btn = document.getElementById('proxyPruneBtn');
+    const selectBtn = document.getElementById('proxySelectInvalidBtn');
+    if (btn) btn.disabled = cbs.length === 0;
+    if (btn) btn.style.opacity = cbs.length === 0 ? '0.7' : '1';
+    if (selectBtn) selectBtn.disabled = false;
+    if (selectBtn) selectBtn.style.opacity = '1';
+  }
+
+  function getSelectedNodeIds(onlyInvalid) {
+    const cbs = document.querySelectorAll('.proxy-node-cb');
+    const ids = [];
+    for (const cb of cbs) {
+      if (cb.checked) ids.push(cb.dataset.id);
+      else if (onlyInvalid !== true && !cb.checked) continue;
+      else if (onlyInvalid === true && cb.dataset.status !== 'healthy') ids.push(cb.dataset.id);
+    }
+    return ids;
+  }
+
+  function selectAllInvalidNodes() {
+    const cbs = document.querySelectorAll('.proxy-node-cb');
+    for (const cb of cbs) {
+      cb.checked = cb.dataset.status !== 'healthy';
+    }
+    updatePruneButtonState();
+  }
+
+  async function refreshProxyStatus() {
+    try { const r = await fetch('/api/proxy-pool/status'); if (!r.ok) return; renderProxyStatus(await r.json()); } catch (_) {}
+  }
   async function proxyAction(path) {
     if (dirty.size && !await saveConfig()) return;
     const reload = document.getElementById('proxyReloadBtn'); const test = document.getElementById('proxyTestBtn');
-    if (reload) reload.disabled = true; if (test) test.disabled = true;
+    const prune = document.getElementById('proxyPruneBtn'); const selectBtn = document.getElementById('proxySelectInvalidBtn');
+    if (reload) reload.disabled = true; if (test) test.disabled = true; if (prune) prune.disabled = true; if (selectBtn) selectBtn.disabled = true;
     try { const r = await fetch(path,{method:'POST'}); const d = await r.json(); if (!r.ok) setNotice(d.detail || 'Proxy pool operation failed', true); else { renderProxyStatus(d); setNotice(''); } }
     catch (e) { setNotice(e.message, true); }
-    finally { if (reload) reload.disabled = !!running; if (test) test.disabled = !!running; }
+    finally { if (reload) reload.disabled = !!running; if (test) test.disabled = !!running; updatePruneButtonState(); }
   }
+  async function proxyPruneAction() {
+    if (dirty.size && !await saveConfig()) return;
+    const ids = getSelectedNodeIds();
+    if (!ids.length) { setNotice(t('proxyBatchDeleteSelected') + ': no nodes selected', true); return; }
+    if (!confirm(t('proxyDeleteConfirm').replace('{n}', ids.length))) return;
+    const prune = document.getElementById('proxyPruneBtn'); const reload = document.getElementById('proxyReloadBtn'); const test = document.getElementById('proxyTestBtn'); const selectBtn = document.getElementById('proxySelectInvalidBtn');
+    if (prune) prune.disabled = true; if (reload) reload.disabled = true; if (test) test.disabled = true; if (selectBtn) selectBtn.disabled = true;
+    try {
+      const r = await fetch('/api/proxy-pool/prune', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({node_ids: ids, only_invalid: false})});
+      const d = await r.json();
+      if (!r.ok) setNotice(d.detail || 'Prune failed', true);
+      else { renderProxyStatus(d); setNotice(t('proxyDeleteResult').replace('{n}', d.removed || 0)); }
+    } catch (e) { setNotice(e.message, true); }
+    finally { if (reload) reload.disabled = !!running; if (test) test.disabled = !!running; if (selectBtn) selectBtn.disabled = false; if (selectBtn) selectBtn.style.opacity = '1'; updatePruneButtonState(); }
+  }
+
+  function setupEventListeners() {
+    // Select-all checkbox
+    const selectAll = document.getElementById('proxySelectAll');
+    if (selectAll) {
+      selectAll.addEventListener('change', function() {
+        const checked = this.checked;
+        document.querySelectorAll('.proxy-node-cb').forEach(cb => cb.checked = checked);
+        updatePruneButtonState();
+      });
+      // Delegate click on table body to auto-uncheck select-all when any row cb changes
+      document.getElementById('proxyPoolRows').addEventListener('change', function(e) {
+        if (e.target && e.target.classList.contains('proxy-node-cb')) {
+          const all = document.querySelectorAll('.proxy-node-cb');
+          const checked = document.querySelectorAll('.proxy-node-cb:checked');
+          if (selectAll) selectAll.checked = all.length > 0 && all.length === checked.length;
+          updatePruneButtonState();
+        }
+      });
+    }
+    // Select invalid button
+    const selectBtn = document.getElementById('proxySelectInvalidBtn');
+    if (selectBtn) selectBtn.onclick = selectAllInvalidNodes;
+    // Prune button
+    const pruneBtn = document.getElementById('proxyPruneBtn');
+    if (pruneBtn) pruneBtn.onclick = proxyPruneAction;
+  }
+
   const reloadBtn = document.getElementById('proxyReloadBtn'); const testBtn = document.getElementById('proxyTestBtn');
   if (reloadBtn) reloadBtn.onclick = () => proxyAction('/api/proxy-pool/reload');
   if (testBtn) testBtn.onclick = () => proxyAction('/api/proxy-pool/test');
-  loadConfig().catch(e => setNotice(e.message,true)); refreshProxyStatus();
-  setInterval(() => { if (reloadBtn) reloadBtn.disabled = !!running; if (testBtn) testBtn.disabled = !!running; refreshProxyStatus(); }, 2000);
+  loadConfig().catch(e => setNotice(e.message,true));
+  refreshProxyStatus();
+  setupEventListeners();
+  setInterval(() => {
+    if (reloadBtn) reloadBtn.disabled = !!running;
+    if (testBtn) testBtn.disabled = !!running;
+    refreshProxyStatus();
+  }, 2000);
 })();

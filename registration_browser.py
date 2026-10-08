@@ -37,8 +37,6 @@ def _managed_proxy_mode():
         return str(config.get("proxy_mode", "auto") or "auto").strip().lower() in ("single", "pool")
     except Exception:
         return False
-
-
 def _is_pre_submit_js_transient(exc):
     if isinstance(exc, (TimeoutError, ContextLostError, PageDisconnectedError)):
         return True
@@ -55,7 +53,8 @@ def _run_pre_submit_js(script, *args):
         if _is_pre_submit_js_transient(exc):
             raise AccountRetryNeeded(f"提交前浏览器 JS 暂时失败: {exc}") from exc
         raise
-_OWN_NAMES = {'is_cloudflare_block_response', 'response_preview', 'start_browser', 'enable_nsfw_for_token', 'stop_browser_proxy_bridge', 'set_tos_accepted', 'fill_email_and_submit', 'getTurnstileToken', 'set_birth_date', 'generate_random_birthdate', 'fill_profile_and_submit', 'click_email_signup_button', 'wait_for_sso_cookie', 'fill_code_and_submit', 'build_profile', 'cleanup_runtime_memory', 'open_signup_page', 'stop_browser', 'encode_grpc_nsfw_settings', 'restart_browser', 'has_profile_form', 'update_nsfw_settings', 'refresh_active_page'}
+
+_OWN_NAMES = {'is_cloudflare_block_response', 'response_preview', 'start_browser', 'enable_nsfw_for_token', 'stop_browser_proxy_bridge', 'set_tos_accepted', 'fill_email_and_submit', 'getTurnstileToken', 'set_birth_date', 'generate_random_birthdate', 'fill_profile_and_submit', 'click_email_signup_button', 'wait_for_sso_cookie', 'fill_code_and_submit', 'build_profile', 'cleanup_runtime_memory', 'open_signup_page', 'stop_browser', 'encode_grpc_nsfw_settings', 'restart_browser', 'has_profile_form', 'update_nsfw_settings', 'refresh_active_page', '_kill_orphan_chromium'}
 
 
 def bind_runtime(namespace):
@@ -235,6 +234,62 @@ def stop_browser_proxy_bridge():
             pass
     browser_proxy_bridge = None
 
+def _kill_orphan_chromium(exc, log_callback=None):
+    """构造失败时 DrissionPage 已拉起的 Chrome 进程会泄漏（browser 对象缺失，无法 quit 收尸）。
+
+    按本次尝试的调试端口精确清理，避免误伤其他 worker 的浏览器或用户自己的 Chrome，
+    防止孤儿 Chrome 堆积推高系统负载、形成"失败-泄漏-更高负载-再失败"的恶性循环。
+    """
+    import os
+    import signal
+    import subprocess
+
+    try:
+        ports = set(re.findall(r"127\.0\.0\.1:(\d{4,5})", str(exc or "")))
+    except Exception:
+        return
+    if not ports:
+        return
+    pids = set()
+    for port in ports:
+        try:
+            out = subprocess.run(
+                ["pgrep", "-f", "remote-debugging-port=%s" % port],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:
+            continue
+        pids.update(int(line) for line in (out.stdout or "").split() if line.isdigit())
+    if not pids:
+        return
+
+    def _alive(pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except Exception:
+            return False
+
+    for pid in sorted(pids):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    deadline = time.time() + 3
+    while time.time() < deadline and any(_alive(pid) for pid in pids):
+        time.sleep(0.5)
+    for pid in sorted(pids):
+        if _alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+    if log_callback:
+        try:
+            log_callback("[Debug] 已清理孤儿浏览器进程: %s" % ", ".join(str(pid) for pid in sorted(pids)))
+        except Exception:
+            pass
+
 def start_browser(log_callback=None, use_proxy=True):
     global browser, page, browser_proxy_bridge, browser_started_with_proxy
     last_exc = None
@@ -263,6 +318,7 @@ def start_browser(log_callback=None, use_proxy=True):
                     bridge.stop()
                 except Exception:
                     pass
+            _kill_orphan_chromium(exc, log_callback)
             if log_callback:
                 mode = "代理" if proxy_enabled else "直连"
                 log_callback(f"[Debug] 浏览器{mode}启动失败(第{attempt}/4次): {exc}")

@@ -2,7 +2,7 @@ import base64
 import json
 import unittest
 
-from proxy_protocols import parse_proxy_line, parse_subscription_source
+from proxy_protocols import MAX_SOURCE_ENTRIES, parse_proxy_line, parse_subscription_source
 
 
 class ProxyProtocolParserTests(unittest.TestCase):
@@ -70,6 +70,19 @@ class ProxyProtocolParserTests(unittest.TestCase):
         self.assertEqual(result.skipped, 2)
         self.assertTrue(any("xhttp" in error for error in result.errors))
         self.assertTrue(any("unknown" in error for error in result.errors))
+
+    def test_subscription_over_limit_keeps_head_nodes(self):
+        lines = [
+            "socks5://user:pass@h%s.example.com:1080#N%s" % (index, index)
+            for index in range(MAX_SOURCE_ENTRIES + 5)
+        ]
+        lines.append("garbage-line-after-cap")
+        result = parse_subscription_source("\n".join(lines))
+        self.assertEqual(len(result.nodes), MAX_SOURCE_ENTRIES)
+        self.assertEqual(result.nodes[0].name, "N0")
+        self.assertEqual(result.nodes[-1].name, "N%s" % (MAX_SOURCE_ENTRIES - 1))
+        self.assertEqual(result.total_lines, MAX_SOURCE_ENTRIES + 6)
+        self.assertEqual(result.errors, [])
 
     def test_display_name_does_not_change_advanced_node_identity(self):
         first = parse_proxy_line("trojan://secret@a.example.com:443?sni=a.example.com#Name-A")

@@ -320,13 +320,36 @@ def proxy_pool_test():
             cfg = engine.validate_config_structure(dict(engine.config))
             manager = get_manager(config=cfg, log=_append_log)
             manager.reload_sources(force=True)
-            results = manager.probe_all(force=True)
+            results = manager.probe_all(force=True, skip_healthy=True)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         _end_maintenance(kind)
-    _append_log("[*] 代理池测试完成: %s 个节点" % len(results))
+    _append_log("[*] 代理池测试完成: %s 个节点（已跳过正常节点）" % len(results))
     return {"ok": True, "results": results, **manager.snapshot()}
+
+
+@app.post("/api/proxy-pool/prune")
+async def proxy_pool_prune(request: Request):
+    """批量删除节点。请求体：{"node_ids":["id1","id2"], "only_invalid": false}"""
+    from proxy_pool import get_manager
+    body = await request.json() if callable(getattr(request, "json", None)) else {}
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+    node_ids = body.get("node_ids", [])
+    if not isinstance(node_ids, list) or not node_ids:
+        raise HTTPException(status_code=400, detail="node_ids 必须是数组且不为空")
+    only_invalid = bool(body.get("only_invalid", True))
+    with _job_lock:
+        engine.load_config()
+        try:
+            cfg = engine.validate_config_structure(dict(engine.config))
+            manager = get_manager(config=cfg, log=_append_log)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    result = manager.prune_nodes(node_ids, only_invalid=only_invalid)
+    _append_log("[*] 代理池批量删除: 移除 %s 个，忽略 %s 个，占用 %s 个" % (result["removed"], result["ignored"], result["inflight"]))
+    return {"ok": True, **result, **manager.snapshot()}
 
 
 @app.post("/api/proxy-pool/preflight")
@@ -439,7 +462,7 @@ def stop():
 def main() -> None:
     import uvicorn
 
-    uvicorn.run("web.server:app", host="127.0.0.1", port=8092, workers=1)
+    uvicorn.run("web.server:app", host="0.0.0.0", port=8092, workers=1)
 
 
 if __name__ == "__main__":

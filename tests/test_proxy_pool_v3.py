@@ -11,6 +11,7 @@ import registration_flow
 from app_config import DEFAULT_CONFIG
 from proxy_bridge import LocalProxyBridge
 from proxy_pool import ProxyPoolError, ProxyPoolManager, ProxyTransportError
+from proxy_pool_v3 import ProbeFamilyState
 from proxy_protocol_runtime import ProtocolRuntimeManager, RuntimeEntry
 from proxy_protocols import ProxyProtocolError, parse_proxy_line
 from registration_flow import (
@@ -95,11 +96,22 @@ class ProxyPoolV3Tests(unittest.TestCase):
             cfg = self.cfg(proxy_mode="single", proxy="http://127.0.0.1:8001", proxy_pool_persist_health=True, proxy_pool_state_file=state, proxy_pool_probe_interval_sec=0)
             manager = ProxyPoolManager(cfg)
             lease = manager.acquire("a", "w", 1, 1, "s", timeout=1)
-            manager.report_success(lease); manager.release(lease); manager.shutdown()
+            manager.report_success(lease); manager.release(lease)
+            with manager._condition:
+                node = next(iter(manager._nodes.values()))
+                node.probe_status = "healthy"; node.last_probed_at = time.time(); node.probe_latency_ms = 123
+                node.probe_error = ""; node.exit_ip = "1.2.3.4"
+                node.ipv4_probe = ProbeFamilyState(status="healthy", tested_at=node.last_probed_at, latency_ms=123, exit_ip="1.2.3.4", error="")
+            manager.shutdown()
             restored = ProxyPoolManager(cfg)
             node = restored.snapshot()["nodes"][0]
             self.assertEqual(node["registration_successes"], 1)
             self.assertEqual(node["business_samples"], 1)
+            self.assertEqual(node["probe_status"], "healthy")
+            self.assertEqual(node["probe_latency_ms"], 123)
+            self.assertEqual(node["exit_ip"], "1.2.3.4")
+            self.assertEqual(node["ipv4_probe"]["status"], "healthy")
+            self.assertEqual(node["ipv4_probe"]["exit_ip"], "1.2.3.4")
             restored.shutdown()
 
     def test_subscription_public_only_rejects_loopback(self):

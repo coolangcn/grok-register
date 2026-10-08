@@ -185,10 +185,10 @@ def create_browser_options(browser_proxy="", extension_path=None):
     return options
 
 
-def _build_request_kwargs(**kwargs):
+def _build_request_kwargs(use_proxy=True, **kwargs):
     request_kwargs = dict(kwargs)
     proxies = request_kwargs.pop("proxies", None)
-    if proxies is None:
+    if use_proxy and proxies is None:
         proxies = get_proxies()
     if proxies:
         request_kwargs["proxies"] = proxies
@@ -196,8 +196,8 @@ def _build_request_kwargs(**kwargs):
     return request_kwargs
 
 
-def http_get(url, **kwargs):
-    request_kwargs = _build_request_kwargs(**kwargs)
+def http_get(url, use_proxy=True, **kwargs):
+    request_kwargs = _build_request_kwargs(use_proxy=use_proxy, **kwargs)
     try:
         return requests.get(url, **request_kwargs)
     except Exception as exc:
@@ -210,9 +210,9 @@ def http_get(url, **kwargs):
         raise
 
 
-def http_post(url, **kwargs):
+def http_post(url, use_proxy=True, **kwargs):
     replay_safe = bool(kwargs.pop("replay_safe", False))
-    request_kwargs = _build_request_kwargs(**kwargs)
+    request_kwargs = _build_request_kwargs(use_proxy=use_proxy, **kwargs)
     try:
         return requests.post(url, **request_kwargs)
     except Exception as exc:
