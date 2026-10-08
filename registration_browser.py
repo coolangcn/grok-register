@@ -380,7 +380,7 @@ def refresh_active_page():
         restart_browser()
     return page
 
-def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
+def click_email_signup_button(timeout=20, log_callback=None, cancel_callback=None):
     global page
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -444,6 +444,22 @@ return candidates[0].text || true;
     if log_callback:
         page_html = page.html[:500] if page else "no page"
         log_callback(f"[Debug] 页面内容片段: {page_html}")
+
+    # 页面已加载但按钮缺失，多半是风控/挑战页占位；按代理传输故障处理，
+    # 让上层释放租约换节点重试，而不是杀死整个 worker。
+    page_url = str(getattr(page, "url", "") or "") if page else ""
+    page_text = ""
+    try:
+        page_text = str(page.html or "")[:4000].lower() if page else ""
+    except Exception:
+        pass
+    challenge_markers = (
+        "__cf_chl", "cf-challenge", "cf_chl_opt", "turnstile",
+        "just a moment", "checking your browser", "attention required",
+        "请稍候", "请等待", "安全验证",
+    )
+    if "challenge" in page_url.lower() or any(marker in page_text for marker in challenge_markers):
+        raise ProxyTransportError("注册页被 Cloudflare/风控挑战页拦截，未找到「使用邮箱注册」按钮")
 
     raise Exception("未找到「使用邮箱注册」按钮")
 
