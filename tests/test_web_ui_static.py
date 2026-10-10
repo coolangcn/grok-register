@@ -6,6 +6,17 @@ from app_config import DEFAULT_CONFIG
 
 
 class WebUIStaticTests(unittest.TestCase):
+    # 凭据/基础设施键不进 WebUI 表单，只在 config.json 维护；
+    # cloudmail_* 单实例键已由「Cloud Mail 实例列表」可视化编辑器取代（渲染由 JS 动态生成，不走 fieldDefs）
+    HIDDEN_KEYS = {
+        "cloudmail_instances",
+        "cloudmail_api_base", "cloudmail_public_token", "cloudmail_domains", "cloudmail_path_messages",
+        "cloudflare_account_id", "cloudflare_api_token",
+        "cloudflare_r2_access_key_id", "cloudflare_r2_s3_endpoint", "cloudflare_r2_secret_access_key",
+        "cloudflare2_account_id", "cloudflare2_api_token",
+        "cloudflare2_r2_access_key_id", "cloudflare2_r2_s3_endpoint", "cloudflare2_r2_secret_access_key",
+    }
+
     @classmethod
     def setUpClass(cls):
         root = Path(__file__).resolve().parents[1] / "web"
@@ -15,7 +26,10 @@ class WebUIStaticTests(unittest.TestCase):
         cls.form_sources = cls.html + "\n" + cls.proxy_js
 
     def test_all_config_keys_are_exposed_by_web_form(self):
-        missing = [key for key in DEFAULT_CONFIG if ("'" + key + "'") not in self.form_sources]
+        missing = [
+            key for key in DEFAULT_CONFIG
+            if key not in self.HIDDEN_KEYS and ("'" + key + "'") not in self.form_sources
+        ]
         self.assertEqual(missing, [], "WebUI missing config fields: %s" % missing)
 
     def test_zh_en_switch_and_persistence_exist(self):
@@ -27,8 +41,10 @@ class WebUIStaticTests(unittest.TestCase):
             "en:{console:'Console'",
         ):
             self.assertIn(marker, self.html)
-        self.assertIn("tabProxy:'代理池'", self.proxy_js)
-        self.assertIn("tabProxy:'Proxy pool'", self.proxy_js)
+        self.assertIn("tabProxy:'代理设置'", self.proxy_js)
+        self.assertIn("tabProxyNodes:'代理节点'", self.proxy_js)
+        self.assertIn("tabProxy:'Proxy settings'", self.proxy_js)
+        self.assertIn("tabProxyNodes:'Proxy nodes'", self.proxy_js)
 
     def test_reference_dashboard_structure_is_present(self):
         self.assertEqual(len(re.findall(r'class="stat"', self.html)), 4)

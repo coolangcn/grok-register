@@ -51,6 +51,9 @@ def registration_retry_disposition(stage, error=None):
     if stage in (STAGE_LEASE_ACQUIRE, STAGE_BROWSER_START, STAGE_PAGE_OPEN):
         return SAFE_NEW_LEASE
     if stage == STAGE_CODE_WAIT:
+        # 验证码等待超时说明从未收到码、无重复提交风险，可安全换租约重放
+        if error is not None and is_proxy_transport_exception(error):
+            return SAFE_NEW_LEASE
         return SAME_LEASE_RECOVERY
     if stage in (STAGE_EMAIL_SUBMIT, STAGE_CODE_SUBMIT, STAGE_PROFILE_SUBMIT, STAGE_SSO_WAIT):
         return OUTCOME_UNCERTAIN
@@ -61,7 +64,10 @@ def registration_retry_disposition(stage, error=None):
 
 class VerificationCodeUnavailable(RuntimeError):
     """Mailbox polling timed out before any verification-code submission began."""
-    pass
+
+    def __init__(self, message: str, timed_out: bool = False):
+        super().__init__(message)
+        self.timed_out = timed_out
 
 
 class VerificationSubmissionUnconfirmed(RuntimeError):
@@ -196,15 +202,10 @@ def register_one_account(callbacks, ops, enable_nsfw=True, max_mail_retry=3):
             mail_ok = True
             break
         except VerificationCodeUnavailable as exc:
-            if mail_try < max_mail_retry:
-                callbacks.log(f"[!] 本邮箱在等待阶段未取到验证码，保持当前代理租约并更换邮箱重试: {exc}")
-                # Keep the code_wait disposition while recovering. If browser
-                # restart itself fails, the outer retry engine must not treat
-                # this as a safe point for acquiring a different proxy lease.
-                _set_registration_stage(STAGE_CODE_WAIT)
-                ops.restart_browser()
-                ops.sleep(1)
-                continue
+            # 收不到验证码的根因通常是代理 IP 被 x.ai 风控拒绝发信（正常 5 秒内可达，
+            # 60 秒仍无即视为代理劣质）——换邮箱无用，立即释放租约换节点
+            if isinstance(exc, VerificationCodeUnavailable) and getattr(exc, "timed_out", False):
+                raise ProxyTransportError(f"验证码等待超时，判定代理 IP 劣质，释放租约换节点: {exc}") from exc
             raise
     if not mail_ok:
         raise RuntimeError("验证码阶段失败，已达到最大重试次数")
@@ -216,7 +217,7 @@ def register_one_account(callbacks, ops, enable_nsfw=True, max_mail_retry=3):
     callbacks.log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
     callbacks.log("[*] 5. 等待 sso cookie")
     _set_registration_stage(STAGE_SSO_WAIT)
-    sso = ops.wait_for_sso_cookie()
+    sso = ops.wait_for_sso_cookie(password=str(profile.get("password") or ""))
     _set_registration_stage(STAGE_ACCOUNT_CONFIRMED)
     if enable_nsfw:
         callbacks.log("[*] 6. 开启 NSFW")
@@ -367,6 +368,8 @@ def _preflight_mail_after_lease(callbacks, ops):
 
 def _run_batch_managed(settings, callbacks, observer, ops):
     result = BatchResult(); retry_count_for_slot = 0; last_cleanup_success_count = 0; first_browser_start = True
+    consecutive_hard_failures = 0  # 连续失败熔断计数：防止环境性故障烧穿邮箱池
+    hard_fail_limit = 20
     try:
         while result.processed_count < settings.count:
             if callbacks.cancelled(): result.cancelled = True; break
@@ -407,7 +410,7 @@ def _run_batch_managed(settings, callbacks, observer, ops):
                     retry_count_for_slot += 1
                     if retry_count_for_slot <= settings.max_slot_retry: callbacks.log(f"[!] 当前账号流程卡住，安全重试第 {retry_count_for_slot}/{settings.max_slot_retry} 次: {exc}")
                     else:
-                        result.fail_count += 1; result.processed_count += 1; retry_count_for_slot = 0; callbacks.log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
+                        result.fail_count += 1; result.processed_count += 1; retry_count_for_slot = 0; consecutive_hard_failures += 1; callbacks.log(f"[-] 当前账号流程卡住，达到最大重试次数，跳过: {exc}")
             except RegistrationRiskDenied as exc:
                 result.fail_count += 1; result.processed_count += 1; retry_count_for_slot = 0
                 callbacks.log(f"[-] 注册风控拒绝，已跳过入库: {exc}")
@@ -423,9 +426,12 @@ def _run_batch_managed(settings, callbacks, observer, ops):
                     if retry_count_for_slot <= settings.max_slot_retry:
                         callbacks.log(f"[!] 当前账号代理在安全阶段不可用，释放租约并重试 {retry_count_for_slot}/{settings.max_slot_retry}: {exc}")
                     else:
-                        result.fail_count += 1; result.processed_count += 1; retry_count_for_slot = 0; callbacks.log(f"[-] 当前账号代理重试达到上限，跳过: {exc}")
+                        result.fail_count += 1; result.processed_count += 1; retry_count_for_slot = 0; consecutive_hard_failures += 1; callbacks.log(f"[-] 当前账号代理重试达到上限，跳过: {exc}")
                 elif disposition == SAFE_NEW_LEASE:
-                    raise
+                    # 页面级异常（占位页、按钮缺失等）不再杀死 worker：跳过当前账号继续跑，
+                    # 由连续失败熔断兜底防止环境性故障无限烧穿邮箱池。
+                    result.fail_count += 1; result.processed_count += 1; retry_count_for_slot = 0; consecutive_hard_failures += 1
+                    callbacks.log(f"[!] 当前账号流程异常，跳过并继续: {exc}")
                 else:
                     result.fail_count += 1; result.processed_count += 1; retry_count_for_slot = 0; callbacks.log(f"[-] 注册失败: {exc}")
             finally:
@@ -434,6 +440,11 @@ def _run_batch_managed(settings, callbacks, observer, ops):
                 except Exception as exc:
                     callbacks.log(f"[Debug] 代理租约释放失败: {exc}")
                 _notify_observer(observer, result, account, output, callbacks)
+            if slot_success:
+                consecutive_hard_failures = 0
+            if consecutive_hard_failures >= hard_fail_limit and result.processed_count < settings.count:
+                callbacks.log(f"[!] 连续 {consecutive_hard_failures} 个账号失败且无成功，停止批次以保护邮箱池；请检查代理池/网络后重试")
+                continue_batch = False
             if not continue_batch or result.cancelled: break
     finally:
         _run_cleanup_safely(ops, callbacks, "任务结束")

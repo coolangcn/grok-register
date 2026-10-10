@@ -114,6 +114,85 @@ class ProxyPoolV3Tests(unittest.TestCase):
             self.assertEqual(node["ipv4_probe"]["exit_ip"], "1.2.3.4")
             restored.shutdown()
 
+    def test_snapshot_limit_and_status_filter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool_file = os.path.join(tmp, "pool.txt")
+            with open(pool_file, "w", encoding="utf-8") as handle:
+                handle.write("\n".join("http://10.0.0.%d:8080" % i for i in range(1, 6)) + "\n")
+            cfg = self.cfg(proxy_mode="pool", proxy_pool_file=pool_file, proxy_pool_probe_interval_sec=0)
+            manager = ProxyPoolManager(cfg)
+            with manager._condition:
+                statuses = ["healthy", "healthy", "unhealthy", "unknown", "healthy"]
+                for node, status in zip(sorted(manager._nodes.values(), key=lambda value: value.id), statuses):
+                    node.probe_status = status
+            full = manager.snapshot()
+            self.assertEqual(full["nodes_total"], 5)
+            self.assertEqual(full["nodes_shown"], 5)
+            self.assertEqual(len(full["nodes"]), 5)
+            limited = manager.snapshot(limit=2)
+            self.assertEqual(len(limited["nodes"]), 2)
+            self.assertEqual(limited["nodes_shown"], 2)
+            self.assertEqual(limited["nodes_total"], 5)
+            healthy = manager.snapshot(status="healthy")
+            self.assertEqual(len(healthy["nodes"]), 3)
+            self.assertTrue(all(n["probe_status"] == "healthy" for n in healthy["nodes"]))
+            filtered_limited = manager.snapshot(status="healthy", limit=2)
+            self.assertEqual(len(filtered_limited["nodes"]), 2)
+            manager.shutdown()
+
+    def test_select_prefers_proven_nodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool_file = os.path.join(tmp, "pool.txt")
+            with open(pool_file, "w", encoding="utf-8") as handle:
+                handle.write("http://10.0.0.1:8080\nhttp://10.0.0.2:8080\n")
+            cfg = self.cfg(proxy_mode="pool", proxy_pool_file=pool_file, proxy_pool_probe_interval_sec=0)
+            manager = ProxyPoolManager(cfg)
+            with manager._condition:
+                nodes = sorted(manager._nodes.values(), key=lambda value: value.id)
+                for node in nodes:
+                    node.probe_status = "healthy"
+                    node.last_probed_at = time.time()
+                nodes[1].registration_successes = 3
+            for affinity in ("account-a", "account-b", "account-c", None):
+                self.assertIs(manager._select_locked(nodes, affinity), nodes[1])
+            # proven 计数归零后恢复普通轮询
+            with manager._condition:
+                nodes[1].registration_successes = 0
+            self.assertIs(manager._select_locked(nodes, "account-a"), nodes[0])
+            manager.shutdown()
+
+    def test_auto_prune_and_reload_exclusion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool_file = os.path.join(tmp, "pool.txt")
+            with open(pool_file, "w", encoding="utf-8") as handle:
+                handle.write("\n".join("http://10.0.0.%d:8080" % i for i in range(1, 6)) + "\n")
+            cfg = self.cfg(proxy_mode="pool", proxy_pool_file=pool_file, proxy_pool_probe_interval_sec=0)
+            manager = ProxyPoolManager(cfg)
+            ids = sorted(manager._nodes.keys())
+            self.assertEqual(len(ids), 5)
+            healthy_id, dead_ids = ids[0], ids[1:4]
+            with manager._condition:
+                manager._nodes[healthy_id].probe_status = "healthy"
+                for node_id in dead_ids:
+                    manager._nodes[node_id].probe_status = "unhealthy"
+            unknown_id = ids[4]
+            removed = manager._auto_prune_probed([{"id": dead_ids[0], "status": "unhealthy"}, {"id": dead_ids[1], "status": "unavailable"}, {"id": dead_ids[2], "status": "unknown"}])
+            self.assertEqual(removed, 2)
+            self.assertNotIn(dead_ids[0], manager._nodes)
+            self.assertNotIn(dead_ids[1], manager._nodes)
+            self.assertIn(dead_ids[2], manager._nodes)  # unknown 不清理
+            self.assertIn(dead_ids[0], manager._pruned_ids)
+            # 刷新后已清理节点不复活，healthy/unknown 保留
+            manager.reload_sources(force=True)
+            self.assertNotIn(dead_ids[0], manager._nodes)
+            self.assertIn(healthy_id, manager._nodes)
+            self.assertIn(unknown_id, manager._nodes)
+            # TTL 过期后允许重新入池
+            manager._pruned_ids[dead_ids[0]] = time.time() - 8 * 86400
+            manager.reload_sources(force=True)
+            self.assertIn(dead_ids[0], manager._nodes)
+            manager.shutdown()
+
     def test_subscription_public_only_rejects_loopback(self):
         cfg = self.cfg(proxy_mode="pool", proxy_pool_subscription_url="http://local.test/list", proxy_pool_subscription_public_only=True)
         with patch.object(socket, "getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))]):
@@ -149,7 +228,7 @@ class ProxyPoolV3Tests(unittest.TestCase):
             start_browser=lambda: None, restart_browser=lambda: None, browser_missing=lambda: False,
             open_signup_page=page, fill_email_and_submit=lambda: ("a@example.com", "token"),
             save_mail_credential=lambda *_: True, fill_code_and_submit=lambda *_: "123456",
-            fill_profile_and_submit=profile, wait_for_sso_cookie=lambda: "sso", enable_nsfw=lambda _: (True, "ok"),
+            fill_profile_and_submit=profile, wait_for_sso_cookie=lambda password="": "sso", enable_nsfw=lambda _: (True, "ok"),
             persist_account_line=lambda *_: None, queue_unsaved_result=lambda *_: True, add_tokens=lambda *_: {},
             export_cpa=lambda *_: {"ok": True, "skipped": False}, cleanup=lambda _: None, sleep=lambda _: None,
             cancelled_exception=Cancelled, retry_exception=RetryNeeded,

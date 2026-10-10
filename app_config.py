@@ -18,7 +18,18 @@ DEFAULT_CONFIG = {
     "cloudmail_api_base": "",
     "cloudmail_public_token": "",
     "cloudmail_domains": "",
+    "cloudmail_instances": [],
     "cloudmail_path_messages": "/api/public/emailList",
+    "cloudflare_account_id": "",
+    "cloudflare_api_token": "",
+    "cloudflare_r2_access_key_id": "",
+    "cloudflare_r2_s3_endpoint": "",
+    "cloudflare_r2_secret_access_key": "",
+    "cloudflare2_account_id": "",
+    "cloudflare2_api_token": "",
+    "cloudflare2_r2_access_key_id": "",
+    "cloudflare2_r2_s3_endpoint": "",
+    "cloudflare2_r2_secret_access_key": "",
     "outlook_accounts_file": "./output/mailboxes/outlook-accounts.txt",
     "proxy_mode": "auto",
     "proxy": "",
@@ -76,6 +87,13 @@ DEFAULT_CONFIG = {
     "yyds_api_key": "",
     "yyds_jwt": "",
     "defaultDomains": "",
+    "auto_batch_enabled": False,
+    "auto_batch_interval_min": 120,
+    "notify_email": "",
+    "notify_smtp_host": "smtp.qq.com",
+    "notify_smtp_port": 465,
+    "notify_smtp_user": "",
+    "notify_smtp_pass": "",
 }
 
 
@@ -128,10 +146,13 @@ def validate_config_structure(raw):
         "cpa_mint_cookie_inject", "multi_thread_enabled",
         "proxy_pool_probe_dual_stack", "proxy_pool_persist_health",
         "proxy_pool_subscription_public_only", "proxy_pool_preflight_enabled",
+        "auto_batch_enabled",
     )
     for key in bool_keys:
         cfg[key] = _require_bool(cfg, key)
     cfg["register_count"] = _require_int(cfg, "register_count", 1, 2500)
+    cfg["auto_batch_interval_min"] = _require_int(cfg, "auto_batch_interval_min", 30, 1440)
+    cfg["notify_smtp_port"] = _require_int(cfg, "notify_smtp_port", 1, 65535)
     cfg["multi_thread_workers"] = _require_int(cfg, "multi_thread_workers", 1, 8)
     cfg["proxy_pool_refresh_interval_sec"] = _require_int(cfg, "proxy_pool_refresh_interval_sec", 0, 86400)
     cfg["proxy_pool_probe_interval_sec"] = _require_int(cfg, "proxy_pool_probe_interval_sec", 0, 86400)
@@ -188,6 +209,14 @@ def validate_config_structure(raw):
         value = cfg[key]
         if not value:
             continue
+        if key == "proxy_pool_subscription_url":
+            # 多订阅源：换行/逗号/分号分隔，逐个校验
+            from proxy_protocols import split_subscription_urls
+            for part in split_subscription_urls(value):
+                parsed = urllib.parse.urlsplit(part)
+                if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                    raise ConfigError(f"配置项 {key} 中的订阅地址 {part} 必须是有效的 http/https URL")
+            continue
         parsed = urllib.parse.urlsplit(value)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise ConfigError(f"配置项 {key} 必须是有效的 http/https URL")
@@ -205,12 +234,16 @@ def validate_run_requirements(cfg):
     if provider == "cloudflare" and not cfg["cloudflare_api_base"]:
         raise ConfigError("Cloudflare 模式需要配置 cloudflare_api_base")
     if provider == "cloudmail":
-        missing = [
-            key for key in ("cloudmail_api_base", "cloudmail_public_token", "cloudmail_domains")
-            if not cfg[key]
-        ]
-        if missing:
-            raise ConfigError("Cloud Mail 模式缺少必需配置: " + ", ".join(missing))
+        if not isinstance(cfg.get("cloudmail_instances"), list):
+            raise ConfigError("配置项 cloudmail_instances 必须是数组")
+        multi = [i for i in cfg["cloudmail_instances"] if isinstance(i, dict) and i.get("enabled") is not False and i.get("api_base") and i.get("token") and i.get("domains")]
+        if not multi:
+            raise ConfigError(
+            "Cloud Mail 模式需要在「Cloud Mail 实例列表」中至少添加并启用一个实例"
+            "（每个实例需填写 API Base、Token、域名）"
+        )
+    if cfg["auto_batch_enabled"] and cfg["notify_email"] and "@" not in cfg["notify_email"]:
+        raise ConfigError("配置项 notify_email 必须是有效的邮箱地址")
     if provider == "yyds" and not (cfg["yyds_api_key"] or cfg["yyds_jwt"]):
         raise ConfigError("YYDS 模式需要至少配置 yyds_api_key 或 yyds_jwt")
     if provider == "outlook":

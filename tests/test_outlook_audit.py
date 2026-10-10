@@ -413,7 +413,7 @@ class OutlookAuditTests(unittest.TestCase):
             save_mail_credential=lambda _email, _token: True,
             fill_code_and_submit=lambda _email, _token: "SECRET123",
             fill_profile_and_submit=lambda: {"given_name": "A", "family_name": "B", "password": "pw"},
-            wait_for_sso_cookie=lambda: "sso",
+            wait_for_sso_cookie=lambda password="": "sso",
             enable_nsfw=lambda _sso: (True, "ok"),
             persist_account_line=lambda _email, _password, _sso: None,
             queue_unsaved_result=lambda _payload, _error: True,

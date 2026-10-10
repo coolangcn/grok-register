@@ -12,6 +12,7 @@ import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as _FuturesTimeoutError
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -254,6 +255,46 @@ def _validate_public_url(url):
         raise ProxyPoolError("代理订阅 public-only 模式拒绝非公网目标")
 
 
+PRUNED_REENTRY_TTL = 7 * 86400  # 已清理节点 7 天后允许重新入池探测（代理可能恢复）
+
+SUCCESS_HISTORY_PATH = os.path.join(_ROOT, "proxy_success_history.json")
+_success_history_lock = threading.Lock()
+
+
+def _load_success_history():
+    try:
+        with open(SUCCESS_HISTORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _record_success_history(node_id, proxy_url, protocol, name, exit_ip):
+    """出过号的代理永久登记（供研究与复用），独立于池清理/复活机制。"""
+    now = time.time()
+    with _success_history_lock:
+        history = _load_success_history()
+        record = history.get(node_id) if isinstance(history.get(node_id), dict) else {}
+        record.update({
+            "proxy_url": proxy_url or record.get("proxy_url") or "",
+            "protocol": protocol or record.get("protocol") or "",
+            "name": name or record.get("name") or "",
+            "exit_ip": exit_ip or record.get("exit_ip") or "",
+        })
+        record["successes"] = int(record.get("successes") or 0) + 1
+        record["last_success_at"] = now
+        record["first_success_at"] = record.get("first_success_at") or now
+        history[node_id] = record
+        try:
+            tmp = SUCCESS_HISTORY_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, SUCCESS_HISTORY_PATH)
+        except Exception:
+            pass
+
+
 class ProxyPoolManager:
     def __init__(self, config, log=None):
         self.config = dict(config or {})
@@ -283,10 +324,47 @@ class ProxyPoolManager:
         self._last_probe_all = 0.0
         self._probe_all_running = False
         self._source_states = {"file": SourceState(), "subscription": SourceState()}
+        self._subscription_last_details: List[Dict] = []
         self._source_diagnostics = {}
         self._persisted_state = self._load_state_file()
+        self._pruned_ids = {}
+        raw_pruned = self._persisted_state.get("pruned")
+        if isinstance(raw_pruned, dict):
+            for key, stamp in raw_pruned.items():
+                try:
+                    self._pruned_ids[str(key)] = float(stamp)
+                except (TypeError, ValueError):
+                    continue
+        self._state_dirty = False
+        self._last_state_save = 0.0
+        self._state_save_lock = threading.Lock()
+        self._cleanup_stale_state_tmp()
         self._runtime = ProtocolRuntimeManager(self.config, log=self.log)
         self.reload_sources(force=True)
+        if self.persist_health:
+            threading.Thread(target=self._state_flush_loop, name="proxy-state-flush", daemon=True).start()
+
+    def _cleanup_stale_state_tmp(self):
+        try:
+            directory = os.path.dirname(os.path.abspath(self.state_path))
+            for name in os.listdir(directory):
+                if name.startswith(".proxy-state-") and name.endswith(".json.tmp"):
+                    try:
+                        os.unlink(os.path.join(directory, name))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    def _state_flush_loop(self):
+        # 后台节流落盘：把高频状态写入合并为每 15 秒最多一次，避免每次事件全量重写 11MB JSON。
+        while True:
+            time.sleep(15)
+            try:
+                if self._state_dirty:
+                    self._save_state_file(force=True)
+            except Exception:
+                pass
 
     @property
     def managed(self):
@@ -297,7 +375,7 @@ class ProxyPoolManager:
             return sum(node.inflight for node in self._nodes.values())
 
     def shutdown(self):
-        self._save_state_file()
+        self._save_state_file(force=True)
         self._runtime.shutdown()
 
     def _load_state_file(self):
@@ -306,55 +384,64 @@ class ProxyPoolManager:
         try:
             with open(self.state_path, "r", encoding="utf-8") as handle:
                 value = json.load(handle)
-            return value.get("nodes", {}) if isinstance(value, dict) else {}
+            return value if isinstance(value, dict) else {}
         except FileNotFoundError:
             return {}
         except Exception as exc:
             self.log("[!] 代理健康状态读取失败，忽略旧状态: %s" % exc)
             return {}
 
-    def _save_state_file(self):
+    def _save_state_file(self, force=False):
         if not self.persist_health:
             return
-        with self._lock:
-            nodes = {}
-            for node in self._nodes.values():
-                if node.retired:
-                    continue
-                nodes[node.id] = {
-                    "health": node.health, "business_samples": node.business_samples,
-                    "registration_successes": node.registration_successes, "transport_failures": node.transport_failures,
-                    "suspected_failures": node.suspected_failures, "configuration_failures": node.configuration_failures,
-                    "exit_successes": node.exit_successes, "exit_failures": node.exit_failures,
-                    "failure_count": node.failure_count, "cooldown_until": node.cooldown_until,
-                    "last_error": node.last_error, "last_success_at": node.last_success_at, "last_failure_at": node.last_failure_at,
-                    "probe_status": node.probe_status, "last_probed_at": node.last_probed_at,
-                    "probe_latency_ms": node.probe_latency_ms, "probe_error": node.probe_error,
-                    "exit_ip": node.exit_ip,
-                    "ipv4_probe": self._family_dict(node.ipv4_probe), "ipv6_probe": self._family_dict(node.ipv6_probe),
-                }
-        directory = os.path.dirname(os.path.abspath(self.state_path))
-        os.makedirs(directory, exist_ok=True)
-        fd = path = None
-        try:
-            fd, path = tempfile.mkstemp(prefix=".proxy-state-", suffix=".json.tmp", dir=directory)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                fd = None
-                json.dump({"version": 1, "saved_at": time.time(), "nodes": nodes}, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-                handle.flush(); os.fsync(handle.fileno())
-            os.replace(path, self.state_path)
-            path = None
-        finally:
-            if fd is not None:
-                try: os.close(fd)
-                except Exception: pass
+        now = time.time()
+        if not force and now - self._last_state_save < 30:
+            self._state_dirty = True
+            return
+        with self._state_save_lock:
+            now = time.time()
+            if not force and now - self._last_state_save < 30:
+                self._state_dirty = True
+                return
+            with self._lock:
+                nodes = {}
+                for node in self._nodes.values():
+                    if node.retired:
+                        continue
+                    nodes[node.id] = {
+                        "health": node.health, "business_samples": node.business_samples,
+                        "registration_successes": node.registration_successes, "transport_failures": node.transport_failures,
+                        "suspected_failures": node.suspected_failures, "configuration_failures": node.configuration_failures,
+                        "exit_successes": node.exit_successes, "exit_failures": node.exit_failures,
+                        "failure_count": node.failure_count, "cooldown_until": node.cooldown_until,
+                        "last_error": node.last_error, "last_success_at": node.last_success_at, "last_failure_at": node.last_failure_at,
+                        "probe_status": node.probe_status, "last_probed_at": node.last_probed_at,
+                        "probe_latency_ms": node.probe_latency_ms, "probe_error": node.probe_error,
+                        "exit_ip": node.exit_ip,
+                        "ipv4_probe": self._family_dict(node.ipv4_probe), "ipv6_probe": self._family_dict(node.ipv6_probe),
+                    }
+            directory = os.path.dirname(os.path.abspath(self.state_path))
+            os.makedirs(directory, exist_ok=True)
+            fd = path = None
+            try:
+                fd, path = tempfile.mkstemp(prefix=".proxy-state-", suffix=".json.tmp", dir=directory)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    fd = None
+                    json.dump({"version": 1, "saved_at": time.time(), "nodes": nodes, "pruned": dict(self._pruned_ids)}, handle, ensure_ascii=False, separators=(",", ":"))
+                    handle.write("\n")
+                    handle.flush(); os.fsync(handle.fileno())
+                os.replace(path, self.state_path)
+                path = None
+            finally:
+                if fd is not None:
+                    try: os.close(fd)
+                    except Exception: pass
             if path:
                 try: os.unlink(path)
                 except Exception: pass
 
     def _restore_node_state(self, node):
-        saved = self._persisted_state.get(node.id)
+        saved = self._persisted_state.get("nodes", {}).get(node.id)
         if not isinstance(saved, dict):
             return
         for key in (
@@ -393,10 +480,12 @@ class ProxyPoolManager:
         with open(path, "r", encoding="utf-8-sig") as handle:
             return parse_subscription_source(handle.read())
 
-    def _fetch_subscription(self):
-        url = str(self.config.get("proxy_pool_subscription_url") or "").strip()
-        if not url:
-            return None
+    @staticmethod
+    def _short_url(url, limit=72):
+        text = str(url or "").strip()
+        return text if len(text) <= limit else text[: limit - 3] + "..."
+
+    def _fetch_single_subscription(self, url):
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise ProxyPoolError("代理订阅必须是有效的 http/https URL")
@@ -436,6 +525,39 @@ class ProxyPoolManager:
         if len(body.encode("utf-8", "ignore")) > _MAX_SOURCE_BYTES:
             raise ProxyPoolError("代理订阅内容超过 2 MiB 限制")
         return parse_subscription_source(body)
+
+    def _fetch_subscription(self):
+        from proxy_protocols import split_subscription_urls, SubscriptionParseResult
+        urls = split_subscription_urls(self.config.get("proxy_pool_subscription_url"))
+        if not urls:
+            return None
+        if len(urls) == 1:
+            self._subscription_last_details = []
+            return self._fetch_single_subscription(urls[0])
+        merged = SubscriptionParseResult()
+        details = []
+        for url in urls:
+            label = self._short_url(url)
+            try:
+                part = self._fetch_single_subscription(url)
+            except Exception as exc:
+                error = safe_proxy_error_text(exc)
+                details.append({"url": label, "ok": False, "error": error})
+                self.log("[!] 订阅 %s 拉取失败: %s" % (label, error))
+                continue
+            merged.nodes.extend(part.nodes)
+            merged.total_lines += part.total_lines
+            merged.decoded_base64 = merged.decoded_base64 or part.decoded_base64
+            for proto, count in part.protocol_counts.items():
+                merged.protocol_counts[proto] = merged.protocol_counts.get(proto, 0) + int(count)
+            merged.errors.extend("%s: %s" % (label, item) for item in part.errors)
+            details.append({"url": label, "ok": True, "nodes": len(part.nodes)})
+            self.log("[*] 订阅 %s 解析 %s 个节点" % (label, len(part.nodes)))
+        self._subscription_last_details = details
+        if not merged.nodes:
+            raise ProxyPoolError("全部订阅拉取失败: " + "；".join(
+                "%s: %s" % (d["url"], d.get("error", "")) for d in details))
+        return merged
 
     def _refresh_source(self, name, loader):
         state = self._source_states[name]
@@ -478,6 +600,10 @@ class ProxyPoolManager:
             return []
         self._refresh_source("file", self._read_file_source)
         self._refresh_source("subscription", self._fetch_subscription)
+        sub_state = self._source_states.get("subscription")
+        sub_details = getattr(self, "_subscription_last_details", [])
+        if sub_state is not None and sub_details:
+            sub_state.diagnostics = {**sub_state.diagnostics, "urls": sub_details}
         values = []
         for name in ("file", "subscription"):
             values.extend((name, item) for item in self._source_states[name].descriptors)
@@ -501,8 +627,13 @@ class ProxyPoolManager:
         entries = self._source_entries()
         with self._condition:
             previous, updated = self._nodes, {}
+            expired_pruned = [key for key, stamp in self._pruned_ids.items() if time.time() - stamp > PRUNED_REENTRY_TTL]
+            for key in expired_pruned:
+                self._pruned_ids.pop(key, None)
             for source, descriptor in entries:
                 node_id = descriptor.node_id
+                if node_id in self._pruned_ids and node_id not in previous:
+                    continue
                 old = previous.get(node_id)
                 if old is not None:
                     old.source, old.proxy_url, old.descriptor = source, descriptor.canonical_uri, descriptor
@@ -588,7 +719,14 @@ class ProxyPoolManager:
     def _select_locked(self, nodes, affinity):
         now = time.time()
         best_tier = min(self._probe_tier(node, now) for node in nodes)
-        pool = sorted((node for node in nodes if self._probe_tier(node, now) == best_tier), key=lambda value: value.id)
+        tier_pool = [node for node in nodes if self._probe_tier(node, now) == best_tier]
+        # 出过号的节点优先：已被注册业务验证过的 IP 大概率再次成功，
+        # 同层内先在 proven 子集里按亲和性哈希选择，没有 proven 才轮询未验证节点
+        proven = sorted(
+            (node for node in tier_pool if node.registration_successes > 0),
+            key=lambda value: (-value.registration_successes, value.id),
+        )
+        pool = proven if proven else sorted(tier_pool, key=lambda value: value.id)
         digest = hashlib.sha256(str(affinity or "").encode("utf-8")).digest()
         selected = pool[int.from_bytes(digest[:8], "big") % len(pool)]
         if selected.rotating or selected.health >= 0.8 or len(pool) == 1:
@@ -702,6 +840,12 @@ class ProxyPoolManager:
                 if not node.last_error.startswith("backend:") and not node.last_error.startswith("configuration:"): node.last_error = ""
             self._condition.notify_all()
         self._save_state_file()
+        try:
+            _record_success_history(lease.node_id, lease.proxy_url or getattr(node, "proxy_url", ""),
+                                    lease.protocol or getattr(node, "protocol", ""),
+                                    getattr(node, "name", ""), getattr(node, "exit_ip", ""))
+        except Exception:
+            pass
 
     def report_soft_failure(self, lease, error):
         if lease is None or lease.node_id in ("direct", "fallback-single"): return
@@ -839,7 +983,14 @@ class ProxyPoolManager:
         else:
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="proxy-family-probe") as executor:
                 futures = {executor.submit(self._probe_family, descriptor, session_key, family): family for family in families}
-                for future in as_completed(futures): outcomes[futures[future]] = future.result()
+                try:
+                    for future in as_completed(futures, timeout=max(self.probe_timeout * 3, 45)):
+                        outcomes[futures[future]] = future.result()
+                except _FuturesTimeoutError:
+                    for future in futures:
+                        if futures[future] not in outcomes:
+                            future.cancel()
+                            outcomes[futures[future]] = ProbeFamilyState(status="unhealthy", tested_at=time.time(), error="probe watchdog timeout")
         ipv4 = outcomes.get("ipv4", ProbeFamilyState()); ipv6 = outcomes.get("ipv6", ProbeFamilyState())
         healthy = [value for value in (ipv4, ipv6) if value.status == "healthy"]
         status = "healthy" if healthy else "unhealthy"
@@ -889,27 +1040,61 @@ class ProxyPoolManager:
                     if self._probe_events.get(node_id) is event: self._probe_events.pop(node_id, None)
         threading.Thread(target=runner, name="proxy-probe-%s" % node_id[:8], daemon=True).start()
 
-    def probe_all(self, force=False, skip_healthy=False):
+    def probe_all(self, force=False, skip_healthy=False, only_ids=None):
         now = time.time()
         with self._lock:
             if not force and self.probe_interval > 0 and now - self._last_probe_all < self.probe_interval: return []
             self._last_probe_all = now
             freshness = max(60, (self.probe_interval * 2) if self.probe_interval > 0 else 300)
+            wanted = set(only_ids or ())
             node_ids = []
             for node in self._nodes.values():
                 if node.retired or node.inflight > 0:
+                    continue
+                if wanted and node.id not in wanted:
                     continue
                 if skip_healthy and node.probe_status == "healthy" and node.last_probed_at and now - node.last_probed_at <= freshness:
                     continue
                 node_ids.append(node.id)
         results = []
         if not node_ids: return results
-        with ThreadPoolExecutor(max_workers=min(32, len(node_ids)), thread_name_prefix="proxy-probe") as executor:
+        per_node_budget = max(30.0, float(self.probe_timeout) * 3)
+        total_budget = per_node_budget * ((len(node_ids) + 31) // 32) + 300.0
+        executor = ThreadPoolExecutor(max_workers=min(32, len(node_ids)), thread_name_prefix="proxy-probe")
+        try:
             futures = {executor.submit(self.probe_node, node_id): node_id for node_id in node_ids}
-            for future in as_completed(futures):
-                try: results.append(future.result())
-                except Exception as exc: results.append({"id": futures[future], "status": "unhealthy", "error": safe_proxy_error_text(exc)})
+            pending = set(futures)
+            try:
+                for future in as_completed(futures, timeout=total_budget):
+                    pending.discard(future)
+                    try: results.append(future.result())
+                    except Exception as exc: results.append({"id": futures[future], "status": "unavailable", "error": safe_proxy_error_text(exc)})
+            except _FuturesTimeoutError:
+                # 看门狗：个别节点 hang（无界 IO/桥启动卡死）时放弃剩余节点，避免整个探测与维护状态永久挂死
+                for future in pending:
+                    future.cancel()
+                    results.append({"id": futures[future], "status": "unavailable", "error": "probe watchdog timeout"})
+                self.log("[!] 探测看门狗触发: %d 个节点超时放弃" % len(pending))
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+        pruned_count = self._auto_prune_probed(results)
+        if pruned_count:
+            self.log("[*] 探测完成，自动清理无效节点 %d 个（剩余 %d 个）" % (pruned_count, len(self._nodes)))
         return results
+
+    def _auto_prune_probed(self, results):
+        """探测结束后自动移除探测失败（unhealthy/unavailable）的节点，未知状态与占用中的节点保留。"""
+        ids = []
+        for item in results:
+            if isinstance(item, dict) and item.get("status") in ("unhealthy", "unavailable"):
+                ids.append(item.get("id"))
+        if not ids:
+            return 0
+        try:
+            return int(self.prune_nodes(ids, only_invalid=True).get("removed", 0))
+        except Exception as exc:
+            self.log("[!] 自动清理无效节点失败，跳过: %s" % safe_proxy_error_text(exc))
+            return 0
 
     def prune_nodes(self, node_ids, only_invalid=False):
         """批量移除代理节点。
@@ -938,6 +1123,7 @@ class ProxyPoolManager:
                     ignored += 1
                     continue
                 self._nodes.pop(node_id, None)
+                self._pruned_ids[node_id] = time.time()
                 removed += 1
             self._condition.notify_all()
         if removed:
@@ -972,10 +1158,22 @@ class ProxyPoolManager:
         finally:
             if runtime_key: self._runtime.release(runtime_key)
 
-    def snapshot(self):
+    def snapshot(self, limit=None, status=None):
         with self._lock:
-            now = time.time(); nodes = []
+            now = time.time()
+            try:
+                limit_value = None if limit in (None, "", 0) else max(0, int(limit))
+            except (TypeError, ValueError):
+                limit_value = None
+            status_value = str(status or "").strip().lower()
+            nodes = []
+            matching_total = 0
             for node in sorted(self._nodes.values(), key=lambda value: value.id):
+                if status_value and (node.probe_status or "unknown") != status_value:
+                    continue
+                matching_total += 1
+                if limit_value is not None and len(nodes) >= limit_value:
+                    continue
                 cooldown = int(max(1, node.cooldown_until - now)) if node.cooldown_until and node.cooldown_until > now else 0
                 gateway_samples = node.exit_successes + node.exit_failures
                 gateway_success_rate = round(node.exit_successes / gateway_samples, 4) if gateway_samples else None
@@ -999,7 +1197,7 @@ class ProxyPoolManager:
             by_backend = {}
             by_source = {}
             by_health_model = {}
-            total = len(nodes)
+            total = len(self._nodes)
             inflight_total = 0
             for nd in self._nodes.values():
                 status = nd.probe_status or "unknown"
@@ -1023,7 +1221,7 @@ class ProxyPoolManager:
                 "by_source": dict(sorted(by_source.items())),
                 "by_health_model": dict(sorted(by_health_model.items())),
             }
-            return {"mode": self.mode, "managed": self.managed, "fallback": self.fallback, "capacity": self.capacity, "nodes": nodes, "sources": dict(self._source_diagnostics), "runtime": self._runtime.active_snapshot(), "persist_health": self.persist_health, "summary": summary}
+            return {"mode": self.mode, "managed": self.managed, "fallback": self.fallback, "capacity": self.capacity, "nodes": nodes, "nodes_total": matching_total, "nodes_shown": len(nodes), "sources": dict(self._source_diagnostics), "runtime": self._runtime.active_snapshot(), "persist_health": self.persist_health, "summary": summary}
 
 
 def get_manager(config=None, log=None):
@@ -1094,7 +1292,7 @@ def report_current_suspected_transport_failure(error):
     if lease is not None: get_manager().report_suspected_transport_failure(lease, error)
 
 
-def manager_snapshot(config=None):
-    try: return get_manager(config=config).snapshot()
+def manager_snapshot(config=None, **kwargs):
+    try: return get_manager(config=config).snapshot(**kwargs)
     except Exception as exc:
         return {"mode": str((config or {}).get("proxy_mode") or "auto"), "managed": False, "nodes": [], "sources": {}, "error": safe_proxy_error_text(exc)}

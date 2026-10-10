@@ -362,7 +362,7 @@ class OutlookTaskRuntime:
             self._raise_if_cancelled(cancel_callback)
             if not code:
                 from registration_flow import VerificationCodeUnavailable
-                raise VerificationCodeUnavailable("Outlook 在 %ss 内未收到验证码邮件" % timeout)
+                raise VerificationCodeUnavailable("Outlook 在 %ss 内未收到验证码邮件" % timeout, timed_out=True)
             return str(code)
         finally:
             lease.mailbox.close()

@@ -217,7 +217,7 @@ class CloudMailAuthTests(unittest.TestCase):
                 "family_name": "User",
                 "password": "pw",
             },
-            wait_for_sso_cookie=lambda: "sso-token",
+            wait_for_sso_cookie=lambda password="": "sso-token",
             enable_nsfw=lambda _sso: (True, "ok"),
             persist_account_line=lambda *_args: None,
             queue_unsaved_result=lambda *_args: True,

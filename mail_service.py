@@ -234,6 +234,8 @@ def cloudflare_get_oai_code(
     deadline = time.time() + timeout
     detail_retries = {}
     next_resend_at = time.time() + 35
+    last_poll_logged_count = None  # 只在数量变化时打印，避免轮询刷屏
+    api_ok_polls = 0; api_error_count = 0; last_api_error = ""  # 超时诊断：区分"没发码"与"没读到"
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         if resend_callback and time.time() >= next_resend_at:
@@ -247,13 +249,16 @@ def cloudflare_get_oai_code(
             next_resend_at = time.time() + 35
         try:
             messages = cloudflare_get_messages(api_base, dev_token)
+            api_ok_polls += 1
         except Exception as exc:
+            api_error_count += 1; last_api_error = str(exc)[:200]
             if log_callback:
                 log_callback(f"[Debug] Cloudflare 拉取邮件列表失败: {exc}")
             sleep_with_cancel(poll_interval, cancel_callback)
             continue
-        if log_callback:
+        if log_callback and len(messages) != last_poll_logged_count:
             log_callback(f"[Debug] Cloudflare 本轮邮件数量: {len(messages)}")
+            last_poll_logged_count = len(messages)
 
         for msg in messages:
             msg_id = msg.get("id") or msg.get("msgid")
@@ -306,7 +311,11 @@ def cloudflare_get_oai_code(
                 attempts = int(detail_retries.get(str(msg_id), {}).get("attempts") or 0)
                 log_callback(f"[Debug] 邮件已解析但未提取到验证码 id={msg_id} detail_attempts={attempts}")
         sleep_with_cancel(poll_interval, cancel_callback)
-    raise VerificationCodeUnavailable(f"Cloudflare 在 {timeout}s 内未收到验证码邮件")
+    if api_error_count:
+        diag = f"轮询成功 {api_ok_polls} 次、失败 {api_error_count} 次，最后读取错误: {last_api_error}（读取通道不稳定）"
+    else:
+        diag = f"轮询 {api_ok_polls} 次全部成功、收件箱始终为空 → 邮箱读取正常，判定 x.ai 未发信（代理 IP 劣质）"
+    raise VerificationCodeUnavailable(f"Cloudflare 在 {timeout}s 内未收到验证码邮件（{diag}）", timed_out=True)
 
 def cloudflare_get_token(api_base, address, password, api_key=None):
     headers = cloudflare_build_headers(content_type=True)
@@ -397,8 +406,9 @@ def _cloudmail_network_label():
 
 
 def _cloudmail_auth_context():
-    token = get_cloudmail_public_token()
-    api_base = get_cloudmail_api_base()
+    # 报告实际使用的实例端点（get_messages 更新），仅在无记录时回退旧单实例字段
+    token = _cloudmail_active_endpoint.get("token") or get_cloudmail_public_token()
+    api_base = _cloudmail_active_endpoint.get("api_base") or get_cloudmail_api_base()
     try:
         host = urllib.parse.urlsplit(api_base).netloc or api_base
     except Exception:
@@ -416,8 +426,8 @@ def _cloudmail_auth_error_message(persistent=False, elapsed=None):
     seconds = max(int(float(elapsed or 0)), 0)
     return (
         f"Cloud Mail Public Token 持续验证失败（约 {seconds}s）。当前请求中的 token 与该 Cloud Mail "
-        "实例保存的 Public Token 不一致；这已超过 Workers KV 收敛等待窗口。请检查 "
-        "cloudmail_api_base、Public Token，以及 Cloud Mail Worker 的 KV namespace 绑定。"
+        "实例保存的 Public Token 不一致；这已超过 Workers KV 收敛等待窗口。请检查「Cloud Mail 实例列表」"
+        "中对应实例的 API Base 与 Public Token，以及该 Worker 的 KV namespace 绑定。"
         f" 诊断: {_cloudmail_auth_context()}"
     )
 
@@ -530,7 +540,15 @@ def cloudmail_preflight(
 
 
 def cloudmail_get_email_and_token():
-    """生成无需预创建账号的 Cloud Mail 收件地址。"""
+    """生成无需预创建账号的 Cloud Mail 收件地址（多实例轮换绑定）。"""
+    inst = cloudmail_next_instance()
+    if inst is not None:
+        domains = inst["domains"]
+        allocator = globals().get("domain_allocator")
+        domain = allocator.next("cloudmail", domains) if allocator is not None else domains[0]
+        address = f"{generate_username(12)}@{domain}"
+        _cloudmail_address_instances[address] = inst
+        return address, f"cloudmail:{address}"
     if not get_cloudmail_api_base():
         raise Exception("Cloud Mail API Base 未配置")
     if not get_cloudmail_public_token():
@@ -558,12 +576,29 @@ def _cloudmail_http_post_with_retry(url, **kwargs):
             time.sleep(0.5 + attempt * 0.5)
     raise last_exc
 
+_cloudmail_active_endpoint = {"api_base": "", "token": ""}
+
 def cloudmail_get_messages(address):
-    api_base = get_cloudmail_api_base()
-    if not api_base:
-        raise Exception("Cloud Mail API Base 未配置")
-    if not get_cloudmail_public_token():
-        raise Exception("Cloud Mail Public Token 未配置")
+    inst = _cloudmail_instance_for_address(address)
+    if inst is None:
+        # 多实例模式下兜底：探测地址等未绑定请求走首个启用实例，而不是旧单实例字段
+        instances = _cloudmail_instances()
+        if instances:
+            inst = instances[0]
+    if inst is not None:
+        api_base = inst["api_base"]
+        path = inst["path"] or get_cloudmail_path()
+        headers = {"Authorization": inst["token"], "Content-Type": "application/json"}
+        _cloudmail_active_endpoint["api_base"] = api_base
+        _cloudmail_active_endpoint["token"] = inst["token"]
+    else:
+        api_base = get_cloudmail_api_base()
+        path = get_cloudmail_path()
+        if not api_base:
+            raise Exception("Cloud Mail API Base 未配置")
+        if not get_cloudmail_public_token():
+            raise Exception("Cloud Mail Public Token 未配置")
+        headers = cloudmail_build_headers()
 
     payload = {
         "toEmail": address,
@@ -573,8 +608,8 @@ def cloudmail_get_messages(address):
         "num": 1,
         "size": 20,
     }
-    url = f"{api_base}{get_cloudmail_path()}"
-    resp = _cloudmail_http_post_with_retry(url, headers=cloudmail_build_headers(), json=payload)
+    url = f"{api_base}{path}"
+    resp = _cloudmail_http_post_with_retry(url, headers=headers, json=payload)
 
     data = None
     try:
@@ -616,6 +651,8 @@ def cloudmail_get_oai_code(
     seen_attempts = {}
     next_resend_at = time.time() + 35
     auth_recovery_used = False
+    last_poll_logged_count = None  # 只在数量变化时打印，避免轮询刷屏
+    api_ok_polls = 0; api_error_count = 0; last_api_error = ""  # 超时诊断：区分"没发码"与"没读到"
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         if resend_callback and time.time() >= next_resend_at:
@@ -629,6 +666,7 @@ def cloudmail_get_oai_code(
             next_resend_at = time.time() + 35
         try:
             messages = cloudmail_get_messages(email)
+            api_ok_polls += 1
         except CloudMailAuthError:
             if auth_recovery_used:
                 raise
@@ -644,12 +682,14 @@ def cloudmail_get_oai_code(
                 initial_failure=True,
             )
         except Exception as exc:
+            api_error_count += 1; last_api_error = str(exc)[:200]
             if log_callback:
                 log_callback(f"[Debug] Cloud Mail 拉取邮件列表失败: {exc}")
             sleep_with_cancel(poll_interval, cancel_callback)
             continue
-        if log_callback:
+        if log_callback and len(messages) != last_poll_logged_count:
             log_callback(f"[Debug] Cloud Mail 本轮邮件数量: {len(messages)}")
+            last_poll_logged_count = len(messages)
         for msg in messages:
             msg_id = msg.get("emailId") or msg.get("email_id") or msg.get("id")
             if not msg_id:
@@ -676,7 +716,67 @@ def cloudmail_get_oai_code(
                     f"id={msg_id} attempt={seen_attempts[msg_id]}"
                 )
         sleep_with_cancel(poll_interval, cancel_callback)
-    raise VerificationCodeUnavailable(f"Cloud Mail 在 {timeout}s 内未收到验证码邮件")
+    if api_error_count:
+        diag = f"轮询成功 {api_ok_polls} 次、失败 {api_error_count} 次，最后读取错误: {last_api_error}（读取通道不稳定）"
+    else:
+        diag = f"轮询 {api_ok_polls} 次全部成功、收件箱始终为空 → 邮箱读取正常，判定 x.ai 未发信（代理 IP 劣质）"
+    raise VerificationCodeUnavailable(f"Cloud Mail 在 {timeout}s 内未收到验证码邮件（{diag}）", timed_out=True)
+
+def _cloudmail_instances():
+    """解析多实例配置（向后兼容旧单实例字段）。
+
+    每项: {api_base, token, domains, path?, enabled?}；enabled=false 的实例跳过。
+    无 cloudmail_instances 时返回空列表，走旧单实例逻辑。
+    """
+    raw = config.get("cloudmail_instances")
+    if not isinstance(raw, list):
+        return []
+    instances = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        if item.get("enabled") is False:
+            continue
+        api_base = str(item.get("api_base") or "").strip().rstrip("/")
+        token = str(item.get("token") or "").strip()
+        domains_raw = item.get("domains") or ""
+        if isinstance(domains_raw, str):
+            domains = [d.strip().lstrip("@") for d in domains_raw.split(",") if d.strip().lstrip("@")]
+        elif isinstance(domains_raw, list):
+            domains = [str(d).strip().lstrip("@") for d in domains_raw if str(d).strip().lstrip("@")]
+        else:
+            domains = []
+        path = str(item.get("path") or "").strip()
+        if api_base and token and domains:
+            instances.append({
+                "api_base": api_base,
+                "token": token,
+                "domains": domains,
+                "path": path if path.startswith("/") else "",
+            })
+    return instances
+
+
+_cloudmail_instance_index = 0
+_cloudmail_address_instances = {}  # address -> instance（生成地址时绑定，查件跟随）
+
+
+def cloudmail_next_instance():
+    """轮换选择下一个 Cloud Mail 实例；未配置多实例时返回 None。"""
+    global _cloudmail_instance_index
+    instances = _cloudmail_instances()
+    if not instances:
+        return None
+    if len(_cloudmail_address_instances) > 4096:
+        _cloudmail_address_instances.clear()
+    inst = instances[_cloudmail_instance_index % len(instances)]
+    _cloudmail_instance_index += 1
+    return inst
+
+
+def _cloudmail_instance_for_address(address):
+    return _cloudmail_address_instances.get(str(address or ""))
+
 
 def cloudmail_next_domain():
     """按配置轮换选择 Cloud Mail 无人收件域名。"""
@@ -759,7 +859,7 @@ def duckmail_get_oai_code(
                     log_callback(f"[*] 从邮件中提取到验证码: {code}")
                 return code
         sleep_with_cancel(poll_interval, cancel_callback)
-    raise VerificationCodeUnavailable(f"在 {timeout}s 内未收到验证码邮件")
+    raise VerificationCodeUnavailable(f"在 {timeout}s 内未收到验证码邮件", timed_out=True)
 
 def extract_verification_code(text, subject=""):
     if subject:
@@ -1152,7 +1252,7 @@ def yyds_get_oai_code(
                     log_callback(f"[*] YYDS 从邮件中提取到验证码: {code}")
                 return code
         sleep_with_cancel(poll_interval, cancel_callback)
-    raise VerificationCodeUnavailable(f"YYDS 在 {timeout}s 内未收到验证码邮件")
+    raise VerificationCodeUnavailable(f"YYDS 在 {timeout}s 内未收到验证码邮件", timed_out=True)
 
 def yyds_get_token(address, api_key=None, jwt=None):
     key = api_key or get_yyds_api_key()

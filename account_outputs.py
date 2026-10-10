@@ -322,7 +322,15 @@ def _grok2api_go_api_base(base):
     parsed = urllib.parse.urlsplit(normalized)
     host = (parsed.hostname or "").lower()
     if parsed.scheme == "http" and host not in {"localhost", "127.0.0.1", "::1"}:
-        raise RemoteTokenRequestError("新版 grok2api 远端管理接口必须使用 HTTPS")
+        # 允许内网地址走 HTTP 直连（避免绕路公网域名）；公网地址仍强制 HTTPS
+        import ipaddress as _ipaddress
+
+        try:
+            private_http = _ipaddress.ip_address(host).is_private
+        except ValueError:
+            private_http = False
+        if not private_http:
+            raise RemoteTokenRequestError("新版 grok2api 远端管理接口必须使用 HTTPS（内网 HTTP 地址除外）")
     return normalized + "/api/admin/v1"
 
 

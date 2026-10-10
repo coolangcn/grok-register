@@ -34,7 +34,7 @@ def make_ops(enable_nsfw=None, export_cpa=None):
         save_mail_credential=lambda email, token: True,
         fill_code_and_submit=lambda email, token: "ABC-123",
         fill_profile_and_submit=lambda: {"given_name": "A", "family_name": "B", "password": "pw"},
-        wait_for_sso_cookie=lambda: "sso-token",
+        wait_for_sso_cookie=lambda password="": "sso-token",
         enable_nsfw=enable_nsfw or (lambda sso: (True, "ok")),
         persist_account_line=lambda email, password, sso: None,
         queue_unsaved_result=lambda payload, error: True,

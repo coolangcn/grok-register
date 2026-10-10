@@ -154,7 +154,7 @@ class WebControlPlaneTests(unittest.TestCase):
             def reload_sources(self, force=False):
                 return {"mode": "single", "managed": True, "nodes": []}
 
-            def probe_all(self, force=False):
+            def probe_all(self, force=False, skip_healthy=False):
                 entered.set()
                 release.wait(2)
                 return [{"id": "node", "status": "healthy"}]
@@ -189,7 +189,7 @@ class WebControlPlaneTests(unittest.TestCase):
             def reload_sources(self, force=False):
                 return {"mode": "single", "managed": True, "nodes": []}
 
-            def probe_all(self, force=False):
+            def probe_all(self, force=False, skip_healthy=False):
                 return [{"id": "node", "status": "healthy"}]
 
             def snapshot(self):

@@ -183,8 +183,8 @@ def run_parallel_batch(count, callbacks, observer, runtime_namespace, accounts_o
             fill_profile_and_submit=lambda: browser_module.fill_profile_and_submit(
                 log_callback=worker_log, cancel_callback=combined_cancelled
             ),
-            wait_for_sso_cookie=lambda: browser_module.wait_for_sso_cookie(
-                log_callback=worker_log, cancel_callback=combined_cancelled
+            wait_for_sso_cookie=lambda password="": browser_module.wait_for_sso_cookie(
+                log_callback=worker_log, cancel_callback=combined_cancelled, password=password
             ),
             enable_nsfw=lambda sso: browser_module.enable_nsfw_for_token(
                 sso, log_callback=worker_log

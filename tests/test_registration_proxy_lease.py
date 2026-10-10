@@ -23,7 +23,7 @@ class RegistrationProxyLeaseTests(unittest.TestCase):
         def fill_code(_email, _token):
             state["code_calls"] += 1
             if state["code_calls"] == 1:
-                raise VerificationCodeUnavailable("未收到验证码")
+                raise VerificationCodeUnavailable("未收到验证码", timed_out=True)
             return "123456"
 
         return RegistrationOperations(
@@ -35,7 +35,7 @@ class RegistrationProxyLeaseTests(unittest.TestCase):
             save_mail_credential=lambda _email, _token: True,
             fill_code_and_submit=fill_code,
             fill_profile_and_submit=lambda: {"given_name": "A", "family_name": "B", "password": "pw"},
-            wait_for_sso_cookie=lambda: "sso-token",
+            wait_for_sso_cookie=lambda password="": "sso-token",
             enable_nsfw=lambda _sso: (True, "ok"),
             persist_account_line=lambda _email, _password, _sso: None,
             queue_unsaved_result=lambda _payload, _error: True,
@@ -62,7 +62,7 @@ class RegistrationProxyLeaseTests(unittest.TestCase):
 
         return state, begin, end
 
-    def test_mail_retry_keeps_one_slot_lease(self):
+    def test_mail_timeout_releases_lease_and_retries(self):
         state = {"browser": False, "restarts": 0, "code_calls": 0}
         callbacks = RegistrationCallbacks(log=lambda _message: None, cancelled=lambda: False)
         observer = lambda _batch, _account, _output: None
@@ -80,12 +80,14 @@ class RegistrationProxyLeaseTests(unittest.TestCase):
                 max_mail_retry=2,
             )
 
+        # 新契约：验证码等待超时 = 代理劣质 → 释放租约换节点重放（换邮箱无用）
         self.assertEqual(result.success_count, 1)
-        self.assertEqual(len(lease["begins"]), 1)
-        self.assertEqual(len(lease["releases"]), 1)
-        self.assertTrue(lease["releases"][0]["success"])
+        self.assertEqual(len(lease["begins"]), 2)
+        self.assertEqual(len(lease["releases"]), 2)
+        self.assertFalse(lease["releases"][0]["success"])
+        self.assertTrue(lease["releases"][1]["success"])
         self.assertEqual(state["code_calls"], 2)
-        self.assertEqual(state["restarts"], 1, "mail retry should restart browser without starting a new slot")
+        self.assertEqual(state["restarts"], 1)
 
     def test_each_processed_account_gets_its_own_slot(self):
         state = {"browser": False, "restarts": 0, "code_calls": 99}

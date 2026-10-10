@@ -303,6 +303,7 @@ def start_browser(log_callback=None, use_proxy=True):
             browser_started_with_proxy = bool(browser_proxy)
             tabs = browser.get_tabs()
             page = tabs[-1] if tabs else browser.new_tab()
+            _remember_browser_pid(browser)
             if log_callback and getattr(browser, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
             if log_callback and get_configured_proxy():
@@ -336,6 +337,103 @@ def start_browser(log_callback=None, use_proxy=True):
         raise ProxyTransportError("Chromium 通过当前代理启动失败: %s" % safe_proxy_error_text(last_exc)) from last_exc
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
+def sweep_orphan_browsers(log_callback=None):
+    """服务启动时清理上次运行残留的注册浏览器（进程被杀/批次中止时 stop_browser 不会执行）。
+
+    仅匹配 DrissionPage 专属资料目录 autoPortData 的 Chromium 进程，
+    不会误伤用户自己的 Chrome（其命令行不含该路径）。
+    """
+    import os
+    import signal
+    import subprocess
+
+    try:
+        out = subprocess.run(["pgrep", "-f", "DrissionPage/autoPortData"], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return 0
+    pids = [int(x) for x in (out.stdout or "").split() if x.isdigit()]
+    if not pids:
+        return 0
+
+    def _alive(pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except Exception:
+            return False
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    deadline = time.time() + 3
+    while time.time() < deadline and any(_alive(pid) for pid in pids):
+        time.sleep(0.3)
+    for pid in pids:
+        if _alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+    if log_callback:
+        log_callback(f"[*] 已清理上次残留的注册浏览器（{len(pids)} 个进程）")
+    return len(pids)
+
+
+_TRACKED_BROWSER_PIDS = []  # 本 worker 启动过的浏览器主进程，stop 时强制收割防泄漏
+
+
+def _remember_browser_pid(browser_obj):
+    try:
+        pid = getattr(browser_obj, "pid", None)
+        if pid and int(pid) > 0:
+            _TRACKED_BROWSER_PIDS.append(int(pid))
+            del _TRACKED_BROWSER_PIDS[:-10]
+    except Exception:
+        pass
+
+
+def _reap_tracked_browsers():
+    """收割本 worker 启动但 quit 失败残留的浏览器（只动自己记录的 PID，不误伤他人）。"""
+    import signal
+    alive = []
+    for pid in _TRACKED_BROWSER_PIDS:
+        try:
+            os.kill(pid, 0)
+            alive.append(pid)
+        except Exception:
+            pass
+    if not alive:
+        _TRACKED_BROWSER_PIDS.clear()
+        return 0
+    for pid in alive:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    deadline = time.time() + 3
+    while time.time() < deadline and alive:
+        alive = [pid for pid in alive if _pid_alive(pid)]
+        if alive:
+            time.sleep(0.5)
+    for pid in alive:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+    _TRACKED_BROWSER_PIDS.clear()
+    return len(alive)
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
 def stop_browser():
     global browser, page, browser_started_with_proxy
     if browser is not None:
@@ -343,6 +441,10 @@ def stop_browser():
             browser.quit(del_data=True)
         except Exception:
             pass
+    try:
+        _reap_tracked_browsers()
+    except Exception:
+        pass
     stop_browser_proxy_bridge()
     browser = None
     page = None
@@ -421,12 +523,30 @@ const candidates = Array.from(document.querySelectorAll('button, a, [role="butto
     .filter((item) => item.score > 0)
     .sort((a, b) => b.score - a.score);
 const target = candidates[0]?.node || null;
+const bodyClass = document.body ? String(document.body.className || '') : '';
+const bodyText = document.body ? String(document.body.innerText || '').slice(0, 3000).toLowerCase() : '';
+const htmlHead = String(document.documentElement.innerHTML || '').slice(0, 8000).toLowerCase();
+const netError = /neterror|err_connection|err_timed_out|err_name_not_resolved|err_proxy|err_tunnel|err_internet_disconnected|ssl-error/i.test(bodyClass)
+    || /this site can.?t be reached|无法访问此|took too long to respond|找不到服务器|服务器 ip 地址|proxy error|隐私设置错误|证书错误|您的连接不是私密连接|此网站无法提供安全连接/.test(bodyText);
+const challenge = /just a moment|checking your browser|attention required|请稍候|请等待|安全验证|not available in your region/.test(bodyText)
+    || /__cf_chl|cf_chl_opt|cf-challenge/.test(htmlHead);
+if (netError) return [false, 'net-error'];
 if (!target) {
-    return false;
+    // 注意：正常页面也带 Cloudflare JSD 脚本（challenge-platform/__CF$cv$params），不能作为挑战页判据；
+    // 只有按钮缺失时才依据强标记（挑战页专属参数/文案）判定占位页。
+    if (challenge) return [false, 'challenge'];
+    return [false, null];
 }
 target.click();
-return candidates[0].text || true;
+return [candidates[0].text || true, null];
         """)
+
+        clicked, blocked = (list(clicked) + [None])[:2] if isinstance(clicked, (list, tuple)) else (clicked, None)
+        if blocked:
+            label = "网络错误页" if blocked == "net-error" else "风控挑战页"
+            if log_callback:
+                log_callback(f"[!] 注册页为{label}占位，未找到「使用邮箱注册」按钮，按代理故障重试")
+            raise ProxyTransportError(f"注册页为{label}占位，未找到「使用邮箱注册」按钮")
 
         if clicked:
             if log_callback:
@@ -454,12 +574,16 @@ return candidates[0].text || true;
     except Exception:
         pass
     challenge_markers = (
-        "__cf_chl", "cf-challenge", "cf_chl_opt", "turnstile",
+        "__cf_chl", "cf_chl_opt", "cf-challenge",
         "just a moment", "checking your browser", "attention required",
-        "请稍候", "请等待", "安全验证",
+        "请稍候", "请等待", "安全验证", "not available in your region",
     )
+    net_error_markers = ("neterror", "err_connection", "err_timed_out", "err_name_not_resolved", "err_proxy",
+                         "err_tunnel", "ssl-error", "隐私设置错误", "证书错误", "您的连接不是私密连接", "此网站无法提供安全连接")
     if "challenge" in page_url.lower() or any(marker in page_text for marker in challenge_markers):
         raise ProxyTransportError("注册页被 Cloudflare/风控挑战页拦截，未找到「使用邮箱注册」按钮")
+    if any(marker in page_text for marker in net_error_markers):
+        raise ProxyTransportError("注册页为浏览器网络/证书错误页，未找到「使用邮箱注册」按钮")
 
     raise Exception("未找到「使用邮箱注册」按钮")
 
@@ -823,7 +947,7 @@ return 'enter';
         )
     raise Exception("未找到邮箱输入框或注册按钮")
 
-def fill_code_and_submit(email, dev_token, timeout=180, transition_timeout=15, log_callback=None, cancel_callback=None):
+def fill_code_and_submit(email, dev_token, timeout=60, transition_timeout=15, log_callback=None, cancel_callback=None):
     def _resend_code():
         page.run_js(
             r"""
@@ -1395,11 +1519,13 @@ return 'submitted';
 
     raise Exception("最终注册页资料填写失败")
 
-def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
+def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None, password=""):
     deadline = time.time() + timeout
     last_seen_names = set()
     last_submit_retry = 0.0
     final_no_submit_state = ""
+    final_submit_click_count = 0
+    final_pw_logged = False
     final_no_submit_since = None
     final_no_submit_timeout = 25
     last_wait_exception_message = ""
@@ -1451,6 +1577,33 @@ return titleHit ? 'final-page' : 'not-final-page';
                         last_submit_retry = now
                         continue
 
+                # 最终页是设置密码页：x.ai 要求创建账户密码，密码为空时提交按钮是禁用状态
+                    if password:
+                        pw_state = page.run_js(
+                            r"""
+const PW = """ + json.dumps(str(password)) + r""";
+const inputs = Array.from(document.querySelectorAll('input[type=password]')).filter((el) => {
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+});
+if (!inputs.length) return 'pw-absent';
+let changed = 0;
+for (const el of inputs) {
+    if ((el.value || '') === PW) continue;
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    setter.call(el, PW);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    changed++;
+}
+return 'pw-filled:' + changed + '/' + inputs.length;
+                            """
+                        )
+                        if isinstance(pw_state, str) and pw_state.startswith("pw-filled:") and pw_state != "pw-filled:0/0":
+                            if log_callback and not final_pw_logged:
+                                log_callback("[*] 最终页需要设置密码，已自动填写并提交保存的密码")
+                                final_pw_logged = True
+
                     retried = page.run_js(
                         r"""
 function isVisible(node) {
@@ -1472,21 +1625,26 @@ function buttonText(node) {
 const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]')).filter((node) => {
     return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
 });
+const norm = (node) => buttonText(node).replace(/\s+/g, '').toLowerCase();
+// SSO/导航类按钮规范化后也可能包含 signup（如 Sign up with Google），必须排除，否则会点到错误按钮导致页面不推进
+const ssoish = (t) => /google|apple|github|microsoft|discord|twitter|signin|登录|返回|cancel|resend|重新发送|guest|游客/.test(t);
+const targetText = (t) => t === '完成注册' || t === '创建账户' || t === 'signup' || t === 'createaccount'
+    || (!ssoish(t) && (t.includes('完成注册') || t.includes('创建账户') || t.includes('signup') || t.includes('createaccount')));
 const submitBtn = buttons.find((node) => {
-    const t = buttonText(node).replace(/\s+/g, '').toLowerCase();
-    return t.includes('完成注册') || t.includes('创建账户') || t.includes('signup') || t.includes('createaccount');
-});
+    const t = norm(node);
+    return t === '完成注册' || t === '创建账户';
+}) || buttons.find((node) => targetText(norm(node)));
 if (!submitBtn) {
     const visibleTexts = buttons.map(buttonText).filter(Boolean).slice(0, 8).join(' | ');
     return 'final-page-no-submit:' + visibleTexts;
 }
 submitBtn.focus();
 submitBtn.click();
-return 'final-page-clicked-submit';
+return 'final-page-clicked-submit:' + buttonText(submitBtn).slice(0, 60);
                         """
                     )
                 last_submit_retry = now
-                if log_callback and (retried == "final-page-clicked-submit" or (isinstance(retried, str) and retried.startswith("final-page-no-submit"))):
+                if log_callback and (isinstance(retried, str) and (retried.startswith("final-page-clicked-submit") or retried.startswith("final-page-no-submit"))):
                     log_callback(f"[Debug] 最终页状态: {retried}")
                 if isinstance(retried, str) and retried.startswith("final-page-no-submit"):
                     if retried != final_no_submit_state:
@@ -1499,6 +1657,20 @@ return 'final-page-clicked-submit';
                 else:
                     final_no_submit_state = ""
                     final_no_submit_since = None
+                # 点击提交后页面长时间不推进时输出诊断，便于定位是点错按钮还是页面报错
+                clicked_now = isinstance(retried, str) and retried.startswith("final-page-clicked-submit")
+                if clicked_now:
+                    final_submit_click_count += 1
+                    if final_submit_click_count in (5, 12):
+                        try:
+                            diag_url = str(getattr(page, "url", "") or "")
+                            diag_text = str(page.html or "")[:400]
+                        except Exception:
+                            diag_url, diag_text = "?", "?"
+                        log_callback(f"[Debug] 最终页点击 {final_submit_click_count} 次未推进, URL: {diag_url}")
+                        log_callback(f"[Debug] 最终页内容片段: {diag_text}")
+                else:
+                    final_submit_click_count = 0
 
             cookies = page.cookies(all_domains=True, all_info=True) or []
             for item in cookies:

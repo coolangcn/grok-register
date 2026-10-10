@@ -457,6 +457,15 @@ def _looks_like_node_text(text):
     return any((scheme + "://") in lower for scheme in SUPPORTED_SCHEMES)
 
 
+def split_subscription_urls(value):
+    """订阅配置支持多源：换行 / 逗号 / 分号分隔多个 http/https URL。"""
+    return [
+        item.strip()
+        for item in str(value or "").replace("\r", ",").replace("\n", ",").replace(";", ",").split(",")
+        if item.strip()
+    ]
+
+
 def parse_subscription_source(text):
     raw_text = str(text or "").lstrip("\ufeff")
     if len(raw_text.encode("utf-8", "ignore")) > MAX_SOURCE_BYTES:

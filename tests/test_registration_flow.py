@@ -34,7 +34,7 @@ class FakeOps:
             save_mail_credential=lambda email, token: True,
             fill_code_and_submit=lambda email, token: "123456",
             fill_profile_and_submit=lambda: {"given_name": "A", "family_name": "B", "password": "pw"},
-            wait_for_sso_cookie=lambda: "sso-token",
+            wait_for_sso_cookie=lambda password="": "sso-token",
             enable_nsfw=lambda sso: (True, "ok"),
             persist_account_line=self._persist,
             queue_unsaved_result=lambda payload, error: True,
@@ -68,8 +68,10 @@ class RegistrationFlowTests(unittest.TestCase):
         fake = FakeOps()
         ops = fake.operations()
         ops.start_browser = lambda: (_ for _ in ()).throw(RuntimeError("start failed"))
-        with self.assertRaises(RuntimeError):
-            run_batch(1, self.callbacks(), lambda *args: None, ops)
+        # 页面/浏览器级失败不再中止批次：跳过账号、记录失败、清理照常执行
+        batch = run_batch(1, self.callbacks(), lambda *args: None, ops)
+        self.assertEqual(batch.fail_count, 1)
+        self.assertEqual(batch.processed_count, 1)
         self.assertEqual(fake.events, [("cleanup", "任务结束")])
 
     def test_last_account_does_not_restart_browser(self):
@@ -143,8 +145,9 @@ class RegistrationFlowTests(unittest.TestCase):
         ops.start_browser = lambda: (_ for _ in ()).throw(RuntimeError("original start error"))
         ops.cleanup = lambda reason: (_ for _ in ()).throw(RuntimeError("cleanup error"))
         logs = []
-        with self.assertRaisesRegex(RuntimeError, "original start error"):
-            run_batch(1, self.callbacks(logs), lambda *args: None, ops)
+        batch = run_batch(1, self.callbacks(logs), lambda *args: None, ops)
+        self.assertEqual(batch.fail_count, 1)
+        self.assertTrue(any("original start error" in line for line in logs))
         self.assertTrue(any("清理失败" in line for line in logs))
 
     def test_postprocessing_exceptions_become_warnings(self):

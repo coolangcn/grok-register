@@ -823,7 +823,7 @@ def run_registration_common(count, log_callback, cancel_callback, accounts_outpu
             save_mail_credential=lambda email, token: _save_mail_credential(email, token, log_callback),
             fill_code_and_submit=lambda email, token: fill_code_and_submit(email, token, log_callback=log_callback, cancel_callback=cancel_callback),
             fill_profile_and_submit=lambda: fill_profile_and_submit(log_callback=log_callback, cancel_callback=cancel_callback),
-            wait_for_sso_cookie=lambda: wait_for_sso_cookie(log_callback=log_callback, cancel_callback=cancel_callback),
+            wait_for_sso_cookie=lambda password="": wait_for_sso_cookie(log_callback=log_callback, cancel_callback=cancel_callback, password=password),
             enable_nsfw=lambda sso: enable_nsfw_for_token(sso, log_callback=log_callback),
             persist_account_line=lambda email, password, sso: _append_account_line(accounts_output_file, email, password, sso),
             queue_unsaved_result=lambda payload, error: _queue_unsaved_account(accounts_output_file, payload, error, log_callback),
